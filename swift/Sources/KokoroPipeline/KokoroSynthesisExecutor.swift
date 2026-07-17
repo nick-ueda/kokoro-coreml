@@ -1,6 +1,27 @@
 import CoreML
 import Foundation
 
+/// The two Core ML packages of the rate-boundary split generator (task T7).
+///
+/// T6 split the ANE-admissible generator at the 2,400-frame rate boundary into
+/// two packages so each stays below the A14's fvmlib object cap (the monolithic
+/// `kokoro_decoder_har_ane_ln_3s` compiles on the Mac but the A14 rejects it —
+/// see `README/Plans/ane-generator-a14-v1.md`, T6 gate + SPLIT DEVICE GATE RUN).
+/// This struct carries the pair through the generator-stage boundary so the
+/// executor can chain them; `predictGeneratorSplit` does the chaining.
+///
+/// - `trunk`: `x_pre`/`ref_s`/`har` → the `(1, 256, 2,400)` seam tensor.
+/// - `body`: seam/`ref_s`/`har` → `spec`/`phase` `(1, 11, 14,401)`.
+public struct GeneratorSplitModels {
+    public let trunk: MLModel
+    public let body: MLModel
+
+    public init(trunk: MLModel, body: MLModel) {
+        self.trunk = trunk
+        self.body = body
+    }
+}
+
 /// Supplies Core ML models to the shared synthesis executor.
 ///
 /// The runtime pipeline uses already-loaded model dictionaries. The benchmark
@@ -12,11 +33,68 @@ public protocol KokoroModelProvider {
     func f0ntrainModel(tFrames: Int) throws -> MLModel
     func decoderPreModel(bucketSec: Int) throws -> MLModel
     func generatorModel(bucketSec: Int) throws -> MLModel
+    /// The two-package rate-boundary split generator (task T7), or `nil` when
+    /// this provider runs the single-package generator (the default — every
+    /// existing provider, incl. the runtime `KokoroPipeline`, is unaffected).
+    /// When non-nil, the executor runs `trunk` → `body` instead of
+    /// `generatorModel(bucketSec:)`; see `predictGeneratorSplit`.
+    func generatorSplitModels(bucketSec: Int) throws -> GeneratorSplitModels?
     func prepareForBucket(bucketSec: Int, tFrames: Int) throws
 }
 
 public extension KokoroModelProvider {
+    func generatorSplitModels(bucketSec: Int) throws -> GeneratorSplitModels? { nil }
     func prepareForBucket(bucketSec: Int, tFrames: Int) throws {}
+}
+
+/// Chain the rate-boundary split generator's two packages (task T7).
+///
+/// This is the ONE place the seam contract lives: the trunk package emits a
+/// tensor named `trunk` `(1, 256, 2,400)`, and the body package consumes it
+/// under the same name alongside the same `ref_s`/`har` the trunk saw
+/// (`noise_convs[1]` is k=1, so the body reads `har` at body length too — see
+/// `export_synth/wrappers.py` `GeneratorBodyANE`). Both `executeKokoroSynthesis`
+/// and the split-parity test call this so the wiring is asserted in exactly one
+/// spot.
+///
+/// - Returns: the body's feature provider (`spec`/`phase`) plus the trunk seam
+///   tensor, so the caller can probe finiteness of BOTH halves and localize a
+///   non-finite result to a stage.
+public func predictGeneratorSplit(
+    trunk: MLModel,
+    body: MLModel,
+    xPre: MLMultiArray,
+    refS: MLMultiArray,
+    har: MLMultiArray
+) throws -> (bodyOutput: MLFeatureProvider, trunkSeam: MLMultiArray) {
+    let trunkInput = try MLDictionaryFeatureProvider(dictionary: [
+        "x_pre": MLFeatureValue(multiArray: xPre),
+        "ref_s": MLFeatureValue(multiArray: refS),
+        "har": MLFeatureValue(multiArray: har),
+    ])
+    let trunkOutput = try trunk.prediction(from: trunkInput)
+    guard let trunkSeam = trunkOutput.featureValue(for: "trunk")?.multiArrayValue else {
+        throw PipelineError.modelNotLoaded("generator split trunk output 'trunk'")
+    }
+    let bodyInput = try MLDictionaryFeatureProvider(dictionary: [
+        "trunk": MLFeatureValue(multiArray: trunkSeam),
+        "ref_s": MLFeatureValue(multiArray: refS),
+        "har": MLFeatureValue(multiArray: har),
+    ])
+    let bodyOutput = try body.prediction(from: bodyInput)
+    return (bodyOutput, trunkSeam)
+}
+
+/// Non-finite census over a flat tensor: `(finiteFraction, nonFinite, total)`.
+///
+/// Shared by the single-package and split finiteness gates (task T5/T7). A
+/// `finiteFraction` below 1.0 means the ANE miscomputed the admitted graph —
+/// see `PipelineError.nonFiniteGeneratorOutput`.
+func finiteCensus(_ values: [Float]) -> (fraction: Double, nonFinite: Int, total: Int) {
+    let nonFinite = values.reduce(0) { $0 + ($1.isFinite ? 0 : 1) }
+    let total = values.count
+    let fraction = total > 0 ? 1.0 - Double(nonFinite) / Double(total) : 1.0
+    return (fraction, nonFinite, total)
 }
 
 /// Pre-tokenized synthesis request for the shared Swift/Core ML pipeline.
@@ -313,12 +391,31 @@ public func executeKokoroSynthesis(
     try tensorDump?.writeFloatArray(name: "har", values: harFlat, shape: [1, 22, harFrames])
 
     // Stage 8: GeneratorFromHar Core ML.
+    //
+    // Two shapes of generator flow through here, both entirely behind this
+    // stage boundary (decoder-pre, F0, the host iSTFT, and the SynthesisResult
+    // shape are untouched by the choice — README/Plans/ane-generator-a14-v1.md
+    // T7):
+    //   - single: one package, one predict (legacy `..._post_*s` → waveform, or
+    //     the ANE `..._ane[_ln]_3s` → spec/phase).
+    //   - split : the T6 rate-boundary pair (task T7), when the provider vends a
+    //     `GeneratorSplitModels`. trunk (x_pre/ref_s/har → the 2,400-frame seam)
+    //     then body (seam/ref_s/har → spec/phase), each half small enough to
+    //     clear the A14's fvmlib cap the monolithic package hit.
     let t14 = CFAbsoluteTimeGetCurrent()
-    let genModel = try modelProvider.generatorModel(bucketSec: bucketSec)
     let genRefS = try makeZeroArray2D(dim: PipelineConstants.voiceEmbeddingDim)
     copyInto(array: genRefS, from: request.refS)
 
-    let genShapes = inputShapes(from: genModel)
+    let splitModels = try modelProvider.generatorSplitModels(bucketSec: bucketSec)
+    // The model whose input geometry drives x_pre/har shaping: the trunk under
+    // a split (it takes the SAME x_pre/ref_s/har as the monolithic package),
+    // else the single generator.
+    let genInputModel = try splitModels?.trunk ?? modelProvider.generatorModel(bucketSec: bucketSec)
+    // The model that PRODUCES the outputs, keyed on to detect the ANE spec/phase
+    // contract: the body under a split, else the single generator.
+    let genOutputModel = splitModels?.body ?? genInputModel
+
+    let genShapes = inputShapes(from: genInputModel)
     let xPreExpectedTime = genShapes["x_pre"]?.last ?? xPre.shape.last!.intValue
     let harExpectedTime = genShapes["har"]?.last ?? harFrames
     let xPrePadded = try zeroPad3D(
@@ -333,11 +430,12 @@ public func executeKokoroSynthesis(
         targetTime: harExpectedTime
     )
 
-    // ANE package detection (T5): via the model's own output description, not
+    // ANE package detection (T5): via the output model's own description, not
     // a policy flag threaded through the pipeline (README/Plans/ane-generator-a14-v1.md
-    // T5). The ANE package (kokoro_decoder_har_ane_3s) stops at spec/phase;
-    // the legacy package (kokoro_decoder_har_post_*s) outputs waveform.
-    let isAneGeneratorPackage = Set(genModel.modelDescription.outputDescriptionsByName.keys)
+    // T5). The ANE packages (kokoro_decoder_har_ane[_ln]_3s, or the split's
+    // body) stop at spec/phase; the legacy package (kokoro_decoder_har_post_*s)
+    // outputs waveform.
+    let isAneGeneratorPackage = Set(genOutputModel.modelDescription.outputDescriptionsByName.keys)
         .isSuperset(of: ["spec", "phase"])
     if isAneGeneratorPackage {
         // T5's geometry finding: unlike the baseline package's har axis
@@ -371,12 +469,29 @@ public func executeKokoroSynthesis(
     try tensorDump?.writeMLMultiArray(name: "x_pre_padded", array: xPrePadded)
     try tensorDump?.writeMLMultiArray(name: "har_padded", array: harPadded)
 
-    let genInput = try MLDictionaryFeatureProvider(dictionary: [
-        "x_pre": MLFeatureValue(multiArray: xPrePadded),
-        "ref_s": MLFeatureValue(multiArray: genRefS),
-        "har": MLFeatureValue(multiArray: harPadded),
-    ])
-    let genOutput = try genModel.prediction(from: genInput)
+    // Split-trunk finiteness census, carried into Stage 9 so both halves are
+    // reported on a single localizing line. `nil` ⇒ single-package path.
+    var splitTrunkCensus: (fraction: Double, nonFinite: Int, total: Int)? = nil
+    let genOutput: MLFeatureProvider
+    if let splitModels {
+        let (bodyOutput, trunkSeam) = try predictGeneratorSplit(
+            trunk: splitModels.trunk,
+            body: splitModels.body,
+            xPre: xPrePadded,
+            refS: genRefS,
+            har: harPadded
+        )
+        splitTrunkCensus = finiteCensus(floatValues(from: trunkSeam))
+        try tensorDump?.writeMLMultiArray(name: "generator_trunk", array: trunkSeam)
+        genOutput = bodyOutput
+    } else {
+        let genInput = try MLDictionaryFeatureProvider(dictionary: [
+            "x_pre": MLFeatureValue(multiArray: xPrePadded),
+            "ref_s": MLFeatureValue(multiArray: genRefS),
+            "har": MLFeatureValue(multiArray: harPadded),
+        ])
+        genOutput = try genInputModel.prediction(from: genInput)
+    }
     let t15 = CFAbsoluteTimeGetCurrent()
     timings.generatorCoreML = t15 - t14
 
@@ -403,17 +518,32 @@ public func executeKokoroSynthesis(
         // The phone's ANE is a different generation and may or may not
         // reproduce this — checked on EVERY pass so the device run makes
         // both admittance and correctness observable, not just the former.
-        let nonFiniteCount = specValues.reduce(0) { $0 + ($1.isFinite ? 0 : 1) }
-            + phaseValues.reduce(0) { $0 + ($1.isFinite ? 0 : 1) }
-        let totalCount = specValues.count + phaseValues.count
-        let finiteFraction = totalCount > 0 ? 1.0 - Double(nonFiniteCount) / Double(totalCount) : 1.0
-        aneGeneratorFiniteFraction = finiteFraction
-        print(
-            "ANEGEN: non-finite output check finite-fraction=\(String(format: "%.4f", finiteFraction)) " +
-            "nonFinite=\(nonFiniteCount) total=\(totalCount)"
-        )
-        guard nonFiniteCount == 0 else {
-            throw PipelineError.nonFiniteGeneratorOutput(finiteFraction: finiteFraction)
+        // Under the split (task T7) the trunk seam is censused too, so a
+        // non-finite result localizes to a stage (trunk vs body) on one line.
+        let bodyCensus = finiteCensus(specValues + phaseValues)
+        if let trunkCensus = splitTrunkCensus {
+            let combinedNonFinite = trunkCensus.nonFinite + bodyCensus.nonFinite
+            let combinedTotal = trunkCensus.total + bodyCensus.total
+            let combinedFraction = combinedTotal > 0
+                ? 1.0 - Double(combinedNonFinite) / Double(combinedTotal) : 1.0
+            aneGeneratorFiniteFraction = combinedFraction
+            print(
+                "ANEGEN: split trunk finite-fraction=\(String(format: "%.4f", trunkCensus.fraction)) " +
+                "body finite-fraction=\(String(format: "%.4f", bodyCensus.fraction)) " +
+                "trunkNonFinite=\(trunkCensus.nonFinite) bodyNonFinite=\(bodyCensus.nonFinite) total=\(combinedTotal)"
+            )
+            guard combinedNonFinite == 0 else {
+                throw PipelineError.nonFiniteGeneratorOutput(finiteFraction: combinedFraction)
+            }
+        } else {
+            aneGeneratorFiniteFraction = bodyCensus.fraction
+            print(
+                "ANEGEN: non-finite output check finite-fraction=\(String(format: "%.4f", bodyCensus.fraction)) " +
+                "nonFinite=\(bodyCensus.nonFinite) total=\(bodyCensus.total)"
+            )
+            guard bodyCensus.nonFinite == 0 else {
+                throw PipelineError.nonFiniteGeneratorOutput(finiteFraction: bodyCensus.fraction)
+            }
         }
 
         let frameCount = specArray.shape.last!.intValue
@@ -633,21 +763,30 @@ private func warmModels(
     ])
     _ = try decPreModel.prediction(from: warmDecIn)
 
-    let genModel = try modelProvider.generatorModel(bucketSec: probe.bucketSec)
-    let genShapes = inputShapes(from: genModel)
-    var warmGenInputs: [String: MLFeatureValue] = [:]
-    for (name, shape) in genShapes {
-        if shape.count == 3 {
-            warmGenInputs[name] = MLFeatureValue(
-                multiArray: try makeZeroArray3D(channels: shape[1], time: shape[2])
-            )
-        } else if shape.count == 2 {
-            warmGenInputs[name] = MLFeatureValue(
-                multiArray: try makeZeroArray2D(dim: shape[1])
-            )
+    // Warm zeros through every generator input axis. Under a split (task T7)
+    // that means both halves — the body's `trunk` input warms exactly like any
+    // other 3D axis, so one helper covers trunk, body, and the single package.
+    func warmGenerator(_ model: MLModel) throws {
+        var warmInputs: [String: MLFeatureValue] = [:]
+        for (name, shape) in inputShapes(from: model) {
+            if shape.count == 3 {
+                warmInputs[name] = MLFeatureValue(
+                    multiArray: try makeZeroArray3D(channels: shape[1], time: shape[2])
+                )
+            } else if shape.count == 2 {
+                warmInputs[name] = MLFeatureValue(
+                    multiArray: try makeZeroArray2D(dim: shape[1])
+                )
+            }
         }
+        _ = try model.prediction(from: try MLDictionaryFeatureProvider(dictionary: warmInputs))
     }
-    _ = try genModel.prediction(from: try MLDictionaryFeatureProvider(dictionary: warmGenInputs))
+    if let splitModels = try modelProvider.generatorSplitModels(bucketSec: probe.bucketSec) {
+        try warmGenerator(splitModels.trunk)
+        try warmGenerator(splitModels.body)
+    } else {
+        try warmGenerator(try modelProvider.generatorModel(bucketSec: probe.bucketSec))
+    }
 }
 
 private func decoderPreFrameCount(fullF0Len: Int) -> Int {

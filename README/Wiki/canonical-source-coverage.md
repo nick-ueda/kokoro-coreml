@@ -58,6 +58,7 @@ This is a deterministic coverage index, not a current-belief page. It lists read
 - [README/Notes/ane-generator-bench-plumbing-2026-07-17.md](../Notes/ane-generator-bench-plumbing-2026-07-17.md)
 - [README/Notes/ane-generator-coreml-export-2026-07-17.md](../Notes/ane-generator-coreml-export-2026-07-17.md)
 - [README/Notes/ane-generator-layernorm-shrink-2026-07-17.md](../Notes/ane-generator-layernorm-shrink-2026-07-17.md)
+- [README/Notes/ane-generator-split-executor-2026-07-17.md](../Notes/ane-generator-split-executor-2026-07-17.md)
 - [README/Notes/ane-pretrim-equivalence-2026-07-17.md](../Notes/ane-pretrim-equivalence-2026-07-17.md)
 - [README/Notes/apple-silicon-nvme-energy-measurement-create-guide-brief.md](../Notes/apple-silicon-nvme-energy-measurement-create-guide-brief.md)
 - [README/Notes/bakeoff-results-v1.md](../Notes/bakeoff-results-v1.md)

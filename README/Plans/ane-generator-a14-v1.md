@@ -385,6 +385,33 @@ this.
     on-device — a finite-fraction on BOTH the trunk seam and the final
     spec/phase — is exactly T7's device deliverable.
 
+- 2026-07-17 **T7 COMPLETE** — T6's split wired through the Swift executor, Mac-
+  verified; NO A14 execution claimed. Full writeup:
+  `README/Notes/ane-generator-split-executor-2026-07-17.md`. The generator stage
+  now runs `kokoro_decoder_har_ane_ln_trunk_3s` → `..._body_3s` → the existing
+  host iSTFT behind the stage boundary (decoder-pre, F0, iSTFT, word-timing, and
+  the SynthesisResult/StageTimings shape all untouched). New surface: a
+  `GeneratorSplitModels` pair + optional `KokoroModelProvider.generatorSplitModels`
+  (default nil, so the runtime pipeline is unaffected) + a `predictGeneratorSplit`
+  helper that owns the seam contract in one spot; `executeKokoroSynthesis` Stage
+  8/9 and `warmModels` branch on the pair. Bench: `StagePolicy.aneGeneratorSplit`
+  (same compute units as `aneGenerator`, 3 s guard, throws — never reroutes),
+  `--policy aneGeneratorSplit`, `--generator-split-packages <trunk>,<body>`
+  override. Split-vs-monolithic parity **48.73 dB** CPU_AND_GPU (gate 40; not
+  bit-identical by design — the fp32 seam re-feed rounds differently than the
+  monolithic's fused internal fp16 seam), via new test
+  `GeneratorSplitParityTests` on REAL inputs (random overflows `exp(conv_post)`;
+  fixture from `scripts/dump_generator_split_inputs.py`). Device instrumentation:
+  the split run emits `ANEGEN: split trunk finite-fraction=... body
+  finite-fraction=...` so a non-finite result localizes to a half, and throws
+  rather than scheduling NaN audio. Acceptance: `swift test` **49/49** (T3
+  goldens untouched), `xcodebuild ... build` **SUCCEEDED**, both `.mlmodelc` in
+  the bundle. **Owner's device gate** (exact scheme args in the note): `--arms
+  coreml --keys 3s --policy aneGeneratorSplit` — `finite-fraction=1.0000` on both
+  halves across a full run = the A14 ANE executes the split correctly = the heat
+  win is on the table; `< 1.0` = the A14 miscomputes the admitted graph like the
+  Mac = the split is a dead end on this silicon (bisect the flagged half next).
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give

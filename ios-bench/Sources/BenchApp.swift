@@ -36,6 +36,16 @@
 ///                           (default kokoro_decoder_har_ane_3s) — walk T6's
 ///                           candidates (kokoro_decoder_har_ane_ln_3s, ...) in
 ///                           one session. See BenchRunner.generatorPackageOverride.
+///   --policy aneGeneratorSplit  T7's rate-boundary split probe: same compute
+///                           units as aneGenerator, but the generator stage
+///                           chains T6's two packages (trunk → body), each half
+///                           small enough to clear the A14's fvmlib cap the
+///                           monolithic package hit. 3s only. See
+///                           ``StagePolicy/aneGeneratorSplit``.
+///   --generator-split-packages <trunk>,<body>  override the aneGeneratorSplit
+///                           pair (default kokoro_decoder_har_ane_ln_trunk_3s,
+///                           kokoro_decoder_har_ane_ln_body_3s). See
+///                           BenchRunner.generatorSplitPackagesOverride.
 ///   --exact-duration 1      use exact-native-LSTM duration packages
 ///                           (kokoro_duration_exact_tN, 780 ops) instead of
 ///                           the padded unrolled ones (17k-134k ops); mirrors
@@ -152,10 +162,23 @@ struct StagePolicy {
         decoderPre: .cpuAndNeuralEngine, generator: .cpuAndNeuralEngine
     )
 
+    /// T7's rate-boundary split probe (README/Plans/ane-generator-a14-v1.md T7):
+    /// identical compute units to `aneGenerator`, but the generator stage runs
+    /// T6's two-package split (trunk → body) instead of one package. Exists
+    /// because the monolithic ln package still hit the A14's fvmlib cap while
+    /// both split halves compile clean (SPLIT DEVICE GATE RUN entry). Same 3 s
+    /// guard: `BundleModelCache.generatorSplitModels` throws for any other
+    /// bucket rather than silently rerouting to the legacy package.
+    static let aneGeneratorSplit = StagePolicy(
+        name: "aneGeneratorSplit",
+        duration: .cpuOnly, f0n: .cpuOnly,
+        decoderPre: .cpuAndNeuralEngine, generator: .cpuAndNeuralEngine
+    )
+
     /// Policies addressable by --policy.
     static let named: [String: StagePolicy] = {
         var byName = [String: StagePolicy]()
-        for p in ladder + [cpuAndNeuralEngine, backgroundSafe, aneGenerator] { byName[p.name] = p }
+        for p in ladder + [cpuAndNeuralEngine, backgroundSafe, aneGenerator, aneGeneratorSplit] { byName[p.name] = p }
         return byName
     }()
 }
@@ -184,11 +207,21 @@ final class BundleModelCache: KokoroModelProvider {
     /// so the owner can walk T6's candidate packages — `kokoro_decoder_har_ane_ln_3s`
     /// (layer_norm-lowered), etc. — in one device session without re-installing.
     static let defaultANEGeneratorPackage = "kokoro_decoder_har_ane_3s"
+    /// Default trunk/body pair for the `aneGeneratorSplit` policy (T6's
+    /// rate-boundary split of the ln-lowered generator). Overridable per launch
+    /// via `--generator-split-packages <trunk>,<body>`
+    /// (BenchRunner.generatorSplitPackagesOverride).
+    static let defaultSplitTrunkPackage = "kokoro_decoder_har_ane_ln_trunk_3s"
+    static let defaultSplitBodyPackage = "kokoro_decoder_har_ane_ln_body_3s"
 
     let policy: StagePolicy
     /// Bundled .mlmodelc name (no extension) the `aneGenerator` policy loads for
     /// the generator stage. Defaults to `defaultANEGeneratorPackage`.
     private let aneGeneratorPackage: String
+    /// Bundled .mlmodelc names for the `aneGeneratorSplit` policy's trunk/body
+    /// pair. Default to `defaultSplitTrunkPackage`/`defaultSplitBodyPackage`.
+    private let splitTrunkPackage: String
+    private let splitBodyPackage: String
     /// Stage family of the most recently vended model. When an ANEF compile
     /// fails at first predict, this is the best in-process hint for which
     /// stage threw; definitive attribution comes from --mode matrix.
@@ -202,10 +235,19 @@ final class BundleModelCache: KokoroModelProvider {
     private var f0nModels: [Int: MLModel] = [:]
     private var decPreModels: [Int: MLModel] = [:]
     private var genModels: [Int: MLModel] = [:]
+    private var genTrunkModels: [Int: MLModel] = [:]
+    private var genBodyModels: [Int: MLModel] = [:]
 
-    init(policy: StagePolicy, useExactDuration: Bool, generatorPackage: String? = nil) {
+    init(
+        policy: StagePolicy,
+        useExactDuration: Bool,
+        generatorPackage: String? = nil,
+        splitPackages: (trunk: String, body: String)? = nil
+    ) {
         self.policy = policy
         self.aneGeneratorPackage = generatorPackage ?? Self.defaultANEGeneratorPackage
+        self.splitTrunkPackage = splitPackages?.trunk ?? Self.defaultSplitTrunkPackage
+        self.splitBodyPackage = splitPackages?.body ?? Self.defaultSplitBodyPackage
         func cfg(_ u: MLComputeUnits) -> MLModelConfiguration {
             let c = MLModelConfiguration(); c.computeUnits = u; return c
         }
@@ -272,6 +314,14 @@ final class BundleModelCache: KokoroModelProvider {
 
     func generatorModel(bucketSec: Int) throws -> MLModel {
         lastVendedStage = "generator"
+        if policy.name == "aneGeneratorSplit" {
+            // The split runs through generatorSplitModels(bucketSec:); a call
+            // here means a caller took the single-package path by mistake.
+            throw PipelineError.modelNotLoaded(
+                "aneGeneratorSplit uses the two-package split (\(splitTrunkPackage)/\(splitBodyPackage)); " +
+                "generatorModel(bucketSec:) is not its entry point"
+            )
+        }
         if policy.name == "aneGenerator" {
             // Fail loudly rather than silently falling back to the legacy
             // package: aneGenerator's whole point is exercising the
@@ -294,10 +344,36 @@ final class BundleModelCache: KokoroModelProvider {
         return m
     }
 
+    func generatorSplitModels(bucketSec: Int) throws -> GeneratorSplitModels? {
+        // Only the split policy vends a pair; every other policy returns nil so
+        // the executor takes the single-package path unchanged (T7).
+        guard policy.name == "aneGeneratorSplit" else { return nil }
+        lastVendedStage = "generator"
+        // Same 3 s guard as aneGenerator: 3 s is the only bucket whose body fits
+        // under the ANE's 16,384-elements-per-axis limit, and the split packages
+        // are exported for it alone (README/Plans/ane-generator-a14-v1.md T6).
+        // Fail loudly rather than reroute to the legacy package.
+        guard bucketSec == 3 else {
+            throw PipelineError.modelNotLoaded(
+                "aneGeneratorSplit only supports the 3s bucket " +
+                "(\(splitTrunkPackage)/\(splitBodyPackage)); got \(bucketSec)s"
+            )
+        }
+        let trunk = try genTrunkModels[bucketSec]
+            ?? MLModel(contentsOf: Self.compiledURL(splitTrunkPackage), configuration: genConfig)
+        genTrunkModels[bucketSec] = trunk
+        let body = try genBodyModels[bucketSec]
+            ?? MLModel(contentsOf: Self.compiledURL(splitBodyPackage), configuration: genConfig)
+        genBodyModels[bucketSec] = body
+        return GeneratorSplitModels(trunk: trunk, body: body)
+    }
+
     func prepareForBucket(bucketSec: Int, tFrames: Int) throws {
         f0nModels = f0nModels.filter { $0.key == tFrames }
         decPreModels = decPreModels.filter { $0.key == bucketSec }
         genModels = genModels.filter { $0.key == bucketSec }
+        genTrunkModels = genTrunkModels.filter { $0.key == bucketSec }
+        genBodyModels = genBodyModels.filter { $0.key == bucketSec }
     }
 }
 
@@ -505,6 +581,22 @@ final class BenchRunner: ObservableObject {
     /// — e.g. `kokoro_decoder_har_ane_ln_3s` (layer_norm-lowered, ~35% fewer ops)
     /// — in one device session. See README/Plans/ane-generator-a14-v1.md T6.
     static let generatorPackageOverride = argValue("--generator-package")
+    /// --generator-split-packages <trunk>,<body>: override the two packages the
+    /// `aneGeneratorSplit` policy chains for the generator stage (default:
+    /// `kokoro_decoder_har_ane_ln_trunk_3s`,`kokoro_decoder_har_ane_ln_body_3s`).
+    /// Comma-separated, exactly two names, no extensions — a malformed value is
+    /// a fatal launch error, never a silent fallback. See
+    /// README/Plans/ane-generator-a14-v1.md T7.
+    static let generatorSplitPackagesOverride: (trunk: String, body: String)? = {
+        guard let raw = argValue("--generator-split-packages") else { return nil }
+        let parts = raw.split(separator: ",", omittingEmptySubsequences: false).map {
+            $0.trimmingCharacters(in: .whitespaces)
+        }
+        guard parts.count == 2, !parts[0].isEmpty, !parts[1].isEmpty else {
+            fatalError("--generator-split-packages expects <trunk>,<body> (two non-empty names); got \(raw)")
+        }
+        return (trunk: parts[0], body: parts[1])
+    }()
     /// Soak mode synthesizes one bucket per run (fresh models per bucket
     /// would re-trigger AOT compiles mid-soak): the first explicit --keys
     /// entry, else 15s (nearest bucket to FreeReader's chunk size).
@@ -725,7 +817,7 @@ final class BenchRunner: ObservableObject {
         // fails restarts lower on the ladder with a fresh cache.
         let ladder = Self.activeLadder
         var ladderIndex = 0
-        var cache = BundleModelCache(policy: ladder[ladderIndex], useExactDuration: Self.exactDuration, generatorPackage: Self.generatorPackageOverride)
+        var cache = BundleModelCache(policy: ladder[ladderIndex], useExactDuration: Self.exactDuration, generatorPackage: Self.generatorPackageOverride, splitPackages: Self.generatorSplitPackagesOverride)
 
         for key in Self.keys {
             let input = try await MainActor.run { try self.loadInput(key) }
@@ -746,7 +838,7 @@ final class BenchRunner: ObservableObject {
                     await recordFailure(key: key, policyName: policy.name, cache: cache, error: error)
                     if ladderIndex + 1 < ladder.count {
                         ladderIndex += 1
-                        cache = BundleModelCache(policy: ladder[ladderIndex], useExactDuration: Self.exactDuration, generatorPackage: Self.generatorPackageOverride)
+                        cache = BundleModelCache(policy: ladder[ladderIndex], useExactDuration: Self.exactDuration, generatorPackage: Self.generatorPackageOverride, splitPackages: Self.generatorSplitPackagesOverride)
                     } else {
                         failure = String(describing: error)
                         break
@@ -808,7 +900,7 @@ final class BenchRunner: ObservableObject {
                 let input = try await MainActor.run { try self.loadInput(key) }
                 // Fresh cache per cell+bucket: no state leaks across cells,
                 // and only one bucket's models are resident on the 4 GB phone.
-                let cache = BundleModelCache(policy: cell.policy, useExactDuration: Self.exactDuration, generatorPackage: Self.generatorPackageOverride)
+                let cache = BundleModelCache(policy: cell.policy, useExactDuration: Self.exactDuration, generatorPackage: Self.generatorPackageOverride, splitPackages: Self.generatorSplitPackagesOverride)
                 await log("matrix \(key) policy=\(cell.policy.name): loading (first load can take many minutes — ANE AOT compile)")
                 do {
                     let series = try await runWarmSeries(input, weights: weights, cache: cache, key: key, policyName: cell.policy.name)
@@ -849,7 +941,7 @@ final class BenchRunner: ObservableObject {
         let key = Self.soakKey
         let weights = try loadHnsfWeights()
         let input = try await MainActor.run { try self.loadInput(key) }
-        let cache = BundleModelCache(policy: policy, useExactDuration: Self.exactDuration, generatorPackage: Self.generatorPackageOverride)
+        let cache = BundleModelCache(policy: policy, useExactDuration: Self.exactDuration, generatorPackage: Self.generatorPackageOverride, splitPackages: Self.generatorSplitPackagesOverride)
         let player = SoakPlayer()
         let csv = SoakCSVLogger()
         Self.seedLaunchArgsFileIfMissing()
