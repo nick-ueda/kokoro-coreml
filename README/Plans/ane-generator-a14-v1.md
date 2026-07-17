@@ -128,8 +128,13 @@ Add an export mode to `export_synth/` producing
 - Verify with coremltools on the Mac: model loads, predicts under
   `.cpuAndNeuralEngine` (macOS will silently reroute — that's fine, this is
   a shape/parity check, not the admittance proof), and full-pipeline parity:
-  spec/phase → T3's golden Python iSTFT → SNR vs the T1 baseline package's
-  waveform ≥ 40 dB (fp16 tolerance).
+  spec/phase → T3's golden Python iSTFT → SNR **≥ 40 dB vs a PyTorch
+  pre-trim reference** (`_forward_pretrim` in
+  `scripts/probe_har_pretrim_adain_equivalence.py`) run on IDENTICAL inputs
+  — the same har tensor on both sides (regenerating har re-draws the hn-nsf
+  RNG and collapses any comparison to ~20 dB). Do NOT gate against the T1
+  baseline package: it is the original graph, ~28 dB from pre-trim by
+  design (see `README/Notes/ane-pretrim-equivalence-2026-07-17.md`).
 - Also dump `MLComputePlan` op-level device usage for the new package under
   CPU_AND_NE (see the Python snippet in
   `README/Guides/apple-silicon/Kokoro-A14-iPhone-generator-execution-guide.md`)
