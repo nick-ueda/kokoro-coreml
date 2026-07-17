@@ -201,7 +201,15 @@ this.
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give
-the agent: this file's path + the single task ID. The agent must read the
+the agent: this file's path + the single task ID. Branch discipline:
+
+- Sole session in the clone: work directly on `spike/freereader-a14`, no
+  task branches, push to `origin` after your task's commit.
+- Concurrent sessions: work in a `git worktree` on a task branch
+  `ane-plan/t<n>-<slug>` cut from the CURRENT `spike/freereader-a14` tip
+  (never from `main` — it predates this plan). Do not push or merge the
+  task branch; report done and the owner fast-forwards it into
+  `spike/freereader-a14`. The agent must read the
 referenced source files before editing, run the task's acceptance check
 itself, commit with a message `ane-plan T<n>: <summary>`, and STOP after two
 failed acceptance attempts with a written finding instead of thrashing.
