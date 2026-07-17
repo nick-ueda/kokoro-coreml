@@ -412,6 +412,36 @@ this.
   win is on the table; `< 1.0` = the A14 miscomputes the admitted graph like the
   Mac = the split is a dead end on this silicon (bisect the flagged half next).
 
+- 2026-07-17 **SPLIT EXECUTION GATE RUN (owner, iPhone 12 Pro / A14)** — **the
+  plan's central bet pays off. The A14 ANE admits AND correctly executes the
+  chained split.** `--arms coreml --keys 3s --policy aneGeneratorSplit`, 7
+  iterations (2 warm + 5 timed):
+  - **Both halves finite every pass:** `ANEGEN: split trunk
+    finite-fraction=1.0000 body finite-fraction=1.0000` (931,222 values checked
+    per pass = trunk 256×2,400 + spec/phase 2×11×14,401), geometry clean
+    (`x_pre 240/240`, `har 14401/14401`). The Mac's admits-then-miscompute
+    corruption (T4/T6 CPU_AND_NE non-finite) does **NOT** reproduce on the A14 —
+    the open question since T4 is answered.
+  - **No CPU fallback, unlike the monolithic.** No `ANECCompile() FAILED` line
+    (the monolithic gate's fatal error is absent), and generator time is
+    **~0.49→0.55 s** — ~40% FASTER than the monolithic's CPU-fallback
+    0.74–0.95 s. Two independent signals (clean compile + faster-than-CPU gen)
+    that the ~90%-ANE-mapped halves (T6 on-device compute plan: trunk 306/337,
+    body 311/346) are actually running on the Neural Engine, not rerouted. Wall
+    ~1.13→1.29 s per 3 s bucket (duration/f0n are pinned CPU under this policy,
+    so wall includes them; RTF ~0.4).
+  - **What is proven vs what remains.** Proven: the split loads, predicts finite,
+    and is numerically correct on the A14, repeatably, with no ANECCompile
+    fallback. Strongly indicated: genuine ANE residency (the two signals above).
+    NOT yet measured — and it is the spike's actual goal: the **power/heat win**.
+    Next (owner-run, a fresh task): the untethered battery soak
+    (`SPIKE_RUNBOOK.md` Test 3b) under `--policy aneGeneratorSplit` for the draw
+    number, and optionally `powermetrics --samplers ane` (non-zero ANE power
+    during a run) or Instruments' Neural Engine track for a direct residency
+    receipt. (Benign, pre-existing, NOT from T7: the
+    `unsafeForcedSync ... Swift Concurrent context` warning is the bench
+    harness's existing nonisolated predict path.)
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give

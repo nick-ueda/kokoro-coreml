@@ -8,6 +8,26 @@ and the Status log's SPLIT DEVICE GATE RUN entry (the A14 rejects the monolithic
 ln package with `ANECCompile() FAILED (11)` — the fvmlib cap — but both split
 halves compile clean).
 
+## Device outcome (owner, iPhone 12 Pro / A14, 2026-07-17) — the split WORKS
+
+`--arms coreml --keys 3s --policy aneGeneratorSplit`, 7 iterations, every pass:
+
+```
+ANEGEN: split trunk finite-fraction=1.0000 body finite-fraction=1.0000 trunkNonFinite=0 bodyNonFinite=0 total=931222
+```
+
+**The A14 ANE admits AND correctly executes the chained split.** The Mac's
+admits-then-miscompute corruption does NOT reproduce, and — unlike the monolithic
+ln package — there is no `ANECCompile() FAILED` fallback: the generator runs at
+**~0.49→0.55 s**, ~40% faster than the monolithic's CPU-fallback 0.74–0.95 s.
+That plus the clean compile (T6's ~90%-ANE-mapped halves) is strong evidence the
+split is genuinely on the Neural Engine. Still to measure — the spike's actual
+goal — is the **power/heat win**: the untethered battery soak
+(`SPIKE_RUNBOOK.md` Test 3b) under `--policy aneGeneratorSplit`, plus optionally
+`powermetrics --samplers ane` for a direct residency receipt. Recorded in the
+plan's Status log (SPLIT EXECUTION GATE RUN). The "success criterion" section
+below is the criterion this run met.
+
 ## Verdict
 
 T6's two split packages now run end to end through the Swift generator stage:
