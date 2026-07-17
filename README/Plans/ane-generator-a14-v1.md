@@ -198,6 +198,15 @@ this.
   `coreml/kokoro_decoder_har_post_3s.mlpackage` — T3's real-case golden and
   T4's parity reference should use it, no re-export needed.
 
+- 2026-07-17 **T3 COMPLETE** (commit 9153e2f, review-validated: swift test
+  48/48; fixtures independently re-derived from Python CustomSTFT, 0.0
+  max-abs). What later tasks inherit: `hostISTFTInverse(spec:phase:frameCount:)`
+  in `swift/Sources/KokoroPipeline/HostISTFT.swift` (spec/phase layout
+  freq-major 11 x T, returns center-trimmed waveform, caller does the final
+  bucket-samples slice); golden dump script at `scripts/dump_istft_golden.py`
+  (needs `voices/af_heart.pt`, one HF download). T4's parity check and T5's
+  executor wiring should call this — do not reimplement.
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give
