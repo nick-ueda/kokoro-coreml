@@ -170,6 +170,98 @@ class GeneratorFromHar(nn.Module):
         phase = torch.sin(x[:, gen.post_n_fft // 2 + 1 :, :])
         return gen.stft.inverse(spec, phase)
 
+class GeneratorFromHarANE(nn.Module):
+    """ANE-admissible variant of ``GeneratorFromHar``: pre-trimmed har in, spec/phase out.
+
+    Exists because the A14's Neural Engine rejects any tensor axis over 16,384
+    elements, and the 3 s ``GeneratorFromHar`` graph violates that ONLY at its
+    boundaries, never in its body (README/Plans/ane-generator-a14-v1.md "Ground
+    truth"). Body axes top out at 14,401. The three offenders are the ``har``
+    input (28,801 frames), the noise-branch intermediates that run at har length,
+    and the 72,000-sample waveform the in-graph iSTFT emits. This wrapper removes
+    all three:
+
+    1. ``har`` arrives already trimmed to the body length (14,401 at 3 s); the
+       caller does the trim on the CPU, where the 16,384 limit does not exist.
+    2. The ``x_source`` crop/pad moves BEFORE ``noise_res[i]``, so the noise
+       branch never materializes a har-length tensor. This also moves AdaIN1d's
+       normalization window onto the kept region only (2,400 / 14,401 instead of
+       4,800 / 28,801) — the one behavioral difference from ``GeneratorFromHar``,
+       and NOT bit-equivalent to it. Task T2 quantified that shift and cleared it:
+       28.06 dB SNR, i.e. 7.6 dB *less* movement than the shipped graph's own
+       run-to-run randomness (hn-nsf redraws sine phase and noise every render).
+       See README/Notes/ane-pretrim-equivalence-2026-07-17.md before touching
+       this ordering — it is deliberate, not a bug.
+    3. The graph stops at ``spec``/``phase`` (both 1, 11, 14,401) instead of
+       calling ``gen.stft.inverse``. ``torch.exp``/``torch.sin`` stay IN the
+       graph; only the overlap-add iSTFT leaves it. The host runs it instead —
+       ``hostISTFTInverse(spec:phase:frameCount:)`` in
+       ``swift/Sources/KokoroPipeline/HostISTFT.swift`` (task T3), or
+       ``CustomSTFT.inverse`` (kokoro/custom_stft.py) on the Python side.
+
+    Everything else is ``GeneratorFromHar.forward`` unchanged, so the two share
+    the same weights and op family. The forward body below is the exact graph
+    ``_forward_pretrim`` in ``scripts/probe_har_pretrim_adain_equivalence.py``
+    validated; ``scripts/verify_decoder_har_ane.py`` asserts this wrapper
+    bit-identical to that function before any conversion runs.
+
+    Inputs:
+        x_pre: decoder output before the generator, ``(B, 512, T_asr)`` — 240 at 3 s.
+        ref_s: full voice embedding ``(B, 256)``; style uses the first
+            ``VOICE_BASELINE_DIM`` channels.
+        har: ``[har_spec, har_phase]`` concatenated on the channel dim, ALREADY
+            trimmed to the body length: ``(B, 22, 14,401)`` at 3 s. Passing an
+            untrimmed ``(B, 22, 28,801)`` har would still run correctly in
+            PyTorch (the crop below handles it) but defeats the entire point.
+
+    Returns:
+        ``(spec, phase)``, each ``(B, 11, 14,401)`` at 3 s.
+
+    Called by:
+        - ``export_synth.convert_ane.export_decoder_har_ane`` — the only exporter.
+        - ``scripts/verify_decoder_har_ane.py`` — the pre-conversion equality gate.
+    """
+
+    def __init__(self, generator):
+        super().__init__()
+        self.generator = generator
+
+    def forward(
+        self, x_pre: torch.Tensor, ref_s: torch.Tensor, har: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        s = ref_s[:, : CoreMLExportConstants.VOICE_BASELINE_DIM]
+        gen = self.generator
+        x = x_pre
+        for i in range(gen.num_upsamples):
+            x = F.leaky_relu(x, negative_slope=0.1)
+            x_source = gen.noise_convs[i](har)
+            x = gen.ups[i](x)
+            if i == gen.num_upsamples - 1:
+                x = gen.reflection_pad(x)
+            tx = x.size(2)
+            ts = x_source.size(2)
+            if ts < tx:
+                x_source = F.pad(x_source, (0, tx - ts))
+            elif ts > tx:
+                x_source = x_source[:, :, :tx]
+            # The pre-trim reorder: AdaIN AFTER the crop, so it normalizes over
+            # the kept region only and never sees a har-length tensor.
+            x_source = gen.noise_res[i](x_source, s)
+            x = x + x_source
+            xs = None
+            for j in range(gen.num_kernels):
+                if xs is None:
+                    xs = gen.resblocks[i * gen.num_kernels + j](x, s)
+                else:
+                    xs = xs + gen.resblocks[i * gen.num_kernels + j](x, s)
+            x = xs / gen.num_kernels
+        x = F.leaky_relu(x)
+        x = gen.conv_post(x)
+        spec = torch.exp(x[:, : gen.post_n_fft // 2 + 1, :])
+        phase = torch.sin(x[:, gen.post_n_fft // 2 + 1 :, :])
+        return spec, phase
+
+
 class CoreMLFriendlyTextEncoder(nn.Module):
     """Replaces the original TextEncoder to avoid pack_padded_sequence."""
     def __init__(self, original_encoder):

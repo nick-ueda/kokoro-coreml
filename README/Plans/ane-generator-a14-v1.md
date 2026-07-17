@@ -237,6 +237,41 @@ this.
   axis with signal (x_pre 120 of 240, har 14,401 of 28,801) and zero-pads the
   rest.
 
+- 2026-07-17 **T4 COMPLETE** — package exported, parity gate MET, and the plan's
+  central premise confirmed at the compute-plan level. Full writeup:
+  `README/Notes/ane-generator-coreml-export-2026-07-17.md`. Export mode:
+  `export_synth/convert_ane.py`, CLI
+  `uv run python -m export_synth.main --mode decoder-har-ane` (3 s only, rewrite
+  ON by default); wrapper `GeneratorFromHarANE` in `export_synth/wrappers.py`;
+  verification `uv run python scripts/verify_decoder_har_ane.py`
+  (`--wrapper-only` = the pre-conversion gate alone). Parity **45.78 dB** vs
+  `_forward_pretrim` on identical har (gate 40 dB), and the wrapper is asserted
+  BIT-IDENTICAL to `_forward_pretrim` before conversion. Compute plan:
+  **98.1% ANE (1,019/1,039 ops)**, 20 on CPU (8 conv, 5 cast, 2 slice_by_index,
+  leaky_relu/expand_dims/pad/reshape/mul x1) — boundary shaping, not hot-loop
+  fallback. **The T1 baseline maps 0/1,038 ops to the ANE (100% CPU)**: the
+  >16,384 axes really were the only thing keeping the generator off the Neural
+  Engine.
+
+  **What T5 and the owner inherit — read before the Phase 1 device gate.**
+  T4's `.cpuAndNeuralEngine` predict instruction assumed "macOS will silently
+  reroute — that's fine". **That assumption is now false, and precisely because
+  T4 worked**: this is the first package the Mac's ANE admits, so nothing
+  reroutes. Under `CPU_AND_NE` the Mac's ANE miscomputes the graph into
+  NON-FINITE output (`phase` decorrelated at -5.59 dB, proving the body diverged,
+  not just `exp()`); the identical package is 45.78 dB on the GPU, so the graph
+  is correct and this is a backend question. Mechanism unidentified after two
+  focused attempts, both falsified: fp16 `reduce_mean` over the long axis (ANE
+  error identical to GPU at T=512/4,096/14,401) and the zero-insert rewrite
+  (no-rewrite variant is also non-finite, also 98.4% ANE-mapped). Parity numbers
+  must therefore be read off `CPU_AND_GPU`; `CPU_AND_NE` on this Mac measures the
+  Mac's ANE, not the graph. **No A14 admittance is claimed** — the phone's ANE is
+  a different generation and the Phase 1 gate is the deciding test. If the phone
+  also returns non-finite, the failure mode is new for this spike (admissible but
+  not correct) and the next probe is bisecting the graph stage by stage.
+  Unrelated housekeeping: `checkpoints/{config.json,kokoro-v1_0.pth}` were broken
+  again at session start; restored per the `.gitignore` procedure.
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give
