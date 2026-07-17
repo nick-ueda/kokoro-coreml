@@ -361,6 +361,30 @@ this.
   probe each half's compile individually. The census is a Mac-side proxy for the
   fvmlib object count — the phone is the judge (Phase 1 gate).
 
+- 2026-07-17 **SPLIT DEVICE GATE RUN (owner, iPhone 12 Pro / A14)** — the reason
+  T7 exists. Ran T6's ladder on the phone:
+  - **Monolithic ln (`kokoro_decoder_har_ane_ln_3s`) still hits the A14 cap.**
+    Under `--policy aneGenerator --generator-package kokoro_decoder_har_ane_ln_3s`
+    the A14 threw `MILCompilerForANE ... ANECCompile() FAILED (11)` at first
+    load, then iOS 26 E5RT rerouted to CPU and synthesized finite output
+    (`finite-fraction=1.0000`; `aneGenerator` pins CPU+NE, no GPU, so the
+    fallback is CPU). Its compute plan under CPU_AND_NE: **569 ANE / 107 CPU /
+    896 const** (total 1,572). The 569-op ANE assignment proves the ops are
+    admissible — the 35% op-count cut was not enough; the rejection is program
+    SIZE (the fvmlib object cap from the T6 gate entry), not op type.
+  - **Both split halves compile CLEAN on the A14** (no `ANECCompile` error at
+    compute-plan load, via `--mode computeplan --model
+    kokoro_decoder_har_ane_ln_{trunk,body}_3s`): trunk **306 ANE / 31 CPU**
+    (337 non-const, ~91% of compute on ANE); body **311 ANE / 35 CPU** (346
+    non-const, ~90%). Halving the program is what clears the cap — this is the
+    green light for T7.
+  - **NOT yet known: whether the A14 ANE, actually EXECUTING the chained split,
+    produces finite output.** The compute plan compiles but does not predict,
+    and this generation's ANE admits-then-miscomputes the monolithic graph on
+    the Mac (T4/T6 CPU_AND_NE non-finite). Making that question observable
+    on-device — a finite-fraction on BOTH the trunk seam and the final
+    spec/phase — is exactly T7's device deliverable.
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give
