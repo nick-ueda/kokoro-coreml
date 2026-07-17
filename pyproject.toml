@@ -23,8 +23,8 @@ dependencies = [
     "loguru",
     "misaki[en]>=0.9.4",
     "numpy",
-    "torch",
-    "torchaudio",
+    "torch==2.5.0",
+    "torchaudio==2.5.0",
     "transformers"
 ]
 
