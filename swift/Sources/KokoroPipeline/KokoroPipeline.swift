@@ -135,6 +135,19 @@ public struct SynthesisResult {
     public let trimSampleCount: Int
     /// Per-input-token duration frame counts (BOS + phoneme ids + EOS), aligned with the caller's ``inputIds`` prefix.
     public let tokenDurationFrames: [Int]
+    /// Finite-fraction of the ANE generator's `spec`+`phase` output, checked on
+    /// every pass (T5's finiteness gate — see
+    /// `README/Plans/ane-generator-a14-v1.md` T5 and T4's Status log entry: on
+    /// this Mac the ANE admits the decoder-har-ane graph and then miscomputes
+    /// it into non-finite output). `nil` when the generator package used for
+    /// this call outputs `waveform` directly (the legacy in-graph-iSTFT
+    /// packages this gate does not apply to). Any value below 1.0 means
+    /// ``executeKokoroSynthesis`` throws
+    /// ``PipelineError/nonFiniteGeneratorOutput(finiteFraction:)`` instead of
+    /// returning — so a successful result only ever carries `nil` or `1.0`
+    /// here. Present anyway so callers (and the results JSON) can see the
+    /// gate ran and passed, not just that it didn't fire.
+    public let aneGeneratorFiniteFraction: Double?
 }
 
 public struct DurationModelChoice {
@@ -435,6 +448,12 @@ public enum PipelineError: Error, LocalizedError {
     case noBucketAvailable
     case modelNotLoaded(String)
     case inputTooLong(tokens: Int, maxTokens: Int)
+    /// T5's finiteness gate: the generator's `spec`/`phase` output contained
+    /// non-finite values (see `README/Plans/ane-generator-a14-v1.md` T5 and
+    /// T4's Status log — the Mac's ANE admits the decoder-har-ane graph and
+    /// then miscomputes it). Thrown instead of returning a result so the
+    /// caller never schedules NaN audio.
+    case nonFiniteGeneratorOutput(finiteFraction: Double)
 
     public var errorDescription: String? {
         switch self {
@@ -444,6 +463,8 @@ public enum PipelineError: Error, LocalizedError {
             return "Model not loaded: \(name)"
         case .inputTooLong(let tokens, let maxTokens):
             return "Input has \(tokens) tokens, but the largest loaded duration model supports \(maxTokens)"
+        case .nonFiniteGeneratorOutput(let finiteFraction):
+            return "ANE generator produced non-finite output (finite fraction \(String(format: "%.4f", finiteFraction)))"
         }
     }
 }

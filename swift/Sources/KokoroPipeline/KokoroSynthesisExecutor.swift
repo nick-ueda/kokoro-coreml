@@ -333,6 +333,41 @@ public func executeKokoroSynthesis(
         targetTime: harExpectedTime
     )
 
+    // ANE package detection (T5): via the model's own output description, not
+    // a policy flag threaded through the pipeline (README/Plans/ane-generator-a14-v1.md
+    // T5). The ANE package (kokoro_decoder_har_ane_3s) stops at spec/phase;
+    // the legacy package (kokoro_decoder_har_post_*s) outputs waveform.
+    let isAneGeneratorPackage = Set(genModel.modelDescription.outputDescriptionsByName.keys)
+        .isSuperset(of: ["spec", "phase"])
+    if isAneGeneratorPackage {
+        // T5's geometry finding: unlike the baseline package's har axis
+        // (28,801, sized 2x the bucket's native frame count — see
+        // README/Notes/ane-pretrim-equivalence-2026-07-17.md's "Flagged for
+        // the owner" section), the ANE package's har axis (14,401) equals
+        // exactly what buildHar naturally produces for a 3 s bucket, and
+        // x_pre's 240 frames are always fully computed by decoder-pre (never
+        // padded — the "120 of 240" figure in that note is asr's own INPUT
+        // frame count, a different axis than x_pre's OUTPUT). Both axes are
+        // therefore fully real content here with no zero-padding, verified
+        // empirically against the Python reference
+        // (build_decoder_har_post_inputs_np) before this branch was wired.
+        print("ANEGEN: geometry x_pre_real=\(xPre.shape.last!.intValue)/\(xPreExpectedTime) har_real=\(harFrames)/\(harExpectedTime)")
+        #if DEBUG
+        assert(
+            xPre.shape.last!.intValue >= xPreExpectedTime,
+            "ANE generator x_pre input underfilled: decoder-pre produced \(xPre.shape.last!.intValue) " +
+            "real frames, package expects \(xPreExpectedTime) — geometry regression, see " +
+            "README/Plans/ane-generator-a14-v1.md T5"
+        )
+        assert(
+            harFrames >= harExpectedTime,
+            "ANE generator har input underfilled: buildHar produced \(harFrames) real frames, " +
+            "package expects \(harExpectedTime) — geometry regression, see " +
+            "README/Plans/ane-generator-a14-v1.md T5"
+        )
+        #endif
+    }
+
     try tensorDump?.writeMLMultiArray(name: "x_pre_padded", array: xPrePadded)
     try tensorDump?.writeMLMultiArray(name: "har_padded", array: harPadded)
 
@@ -345,16 +380,55 @@ public func executeKokoroSynthesis(
     let t15 = CFAbsoluteTimeGetCurrent()
     timings.generatorCoreML = t15 - t14
 
-    // Stage 9: trim waveform.
+    // Stage 9: waveform reconstruction, then trim.
+    //
+    // The legacy package (kokoro_decoder_har_post_*s) carries the iSTFT
+    // in-graph and returns `waveform` directly. The ANE package
+    // (kokoro_decoder_har_ane_3s) stops at spec/phase — every axis past that
+    // point exceeds the ANE's 16,384-elements-per-axis limit (see
+    // README/Plans/ane-generator-a14-v1.md Ground Truth) — so T3's host-side
+    // iSTFT (HostISTFT.swift) reconstructs the waveform here instead.
     let t16 = CFAbsoluteTimeGetCurrent()
-    let waveformKey = genOutput.featureNames.contains("waveform") ? "waveform" : genOutput.featureNames.first!
-    let waveformArray = genOutput.featureValue(for: waveformKey)!.multiArrayValue!
+    var aneGeneratorFiniteFraction: Double? = nil
+    let fullWaveform: [Float]
+    if isAneGeneratorPackage {
+        let specArray = genOutput.featureValue(for: "spec")!.multiArrayValue!
+        let phaseArray = genOutput.featureValue(for: "phase")!.multiArrayValue!
+        let specValues = floatValues(from: specArray)
+        let phaseValues = floatValues(from: phaseArray)
+
+        // T5's finiteness gate (T4's inheritance): on this Mac the ANE admits
+        // the decoder-har-ane graph and then miscomputes it into non-finite
+        // output (README/Notes/ane-generator-coreml-export-2026-07-17.md).
+        // The phone's ANE is a different generation and may or may not
+        // reproduce this — checked on EVERY pass so the device run makes
+        // both admittance and correctness observable, not just the former.
+        let nonFiniteCount = specValues.reduce(0) { $0 + ($1.isFinite ? 0 : 1) }
+            + phaseValues.reduce(0) { $0 + ($1.isFinite ? 0 : 1) }
+        let totalCount = specValues.count + phaseValues.count
+        let finiteFraction = totalCount > 0 ? 1.0 - Double(nonFiniteCount) / Double(totalCount) : 1.0
+        aneGeneratorFiniteFraction = finiteFraction
+        print(
+            "ANEGEN: non-finite output check finite-fraction=\(String(format: "%.4f", finiteFraction)) " +
+            "nonFinite=\(nonFiniteCount) total=\(totalCount)"
+        )
+        guard nonFiniteCount == 0 else {
+            throw PipelineError.nonFiniteGeneratorOutput(finiteFraction: finiteFraction)
+        }
+
+        let frameCount = specArray.shape.last!.intValue
+        fullWaveform = hostISTFTInverse(spec: specValues, phase: phaseValues, frameCount: frameCount)
+    } else {
+        let waveformKey = genOutput.featureNames.contains("waveform") ? "waveform" : genOutput.featureNames.first!
+        fullWaveform = floatValues(from: genOutput.featureValue(for: waveformKey)!.multiArrayValue!)
+    }
+
     let originalF0Len = frames * 2
     let targetLen = Int(
         round(Double(originalF0Len) / PipelineConstants.f0FrameRate * Double(PipelineConstants.sampleRate))
     )
-    let trimLen = min(waveformArray.count, targetLen)
-    let rawAudio = floatValues(from: waveformArray, limit: trimLen)
+    let trimLen = min(fullWaveform.count, targetLen)
+    let rawAudio = Array(fullWaveform.prefix(trimLen))
     let expectedAudioSamples = predDur.reduce(0, +) * PipelineConstants.samplesPerDurationFrame
     #if DEBUG
     if trimLen < expectedAudioSamples {
@@ -373,11 +447,10 @@ public func executeKokoroSynthesis(
     timings.trim = t17 - t16
 
     if tensorDump != nil {
-        let waveformValues = floatValues(from: waveformArray)
         try tensorDump?.writeFloatArray(
             name: "waveform_full",
-            values: waveformValues,
-            shape: waveformArray.shape.map { $0.intValue }
+            values: fullWaveform,
+            shape: [fullWaveform.count]
         )
         try tensorDump?.writeFloatArray(name: "waveform_raw_trimmed", values: rawAudio, shape: [trimLen])
         try tensorDump?.writeFloatArray(name: "waveform", values: audio, shape: [trimLen])
@@ -400,7 +473,8 @@ public func executeKokoroSynthesis(
         xPreExpectedTime: xPreExpectedTime,
         harExpectedTime: harExpectedTime,
         trimSampleCount: trimLen,
-        tokenDurationFrames: predDur
+        tokenDurationFrames: predDur,
+        aneGeneratorFiniteFraction: aneGeneratorFiniteFraction
     )
 }
 

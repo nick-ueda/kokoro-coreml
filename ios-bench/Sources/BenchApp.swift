@@ -15,14 +15,23 @@
 ///   --arms coreml,mlx       which arms to run (default: both; ladder mode only)
 ///   --keys 7s,15s,30s       which buckets (default: 3s,7s,15s,30s)
 ///   --out results.json      output filename in Documents
-///   --mode ladder|matrix|g2p  ladder (default): walk the compute-policy
-///                           fallback ladder per bucket. matrix: single-stage
-///                           compute-unit flips for ANE-rejection attribution
-///                           (coreml arm only; see ``BenchRunner/matrixCells``).
-///                           g2p: time ONLY the Misaki G2P pass per input
-///                           (via ``KokoroTTS/phonemizeOnlyForBench``) to
-///                           bound the raw-text-vs-pretokenized boundary
-///                           asymmetry between the two arms numerically.
+///   --mode ladder|matrix|g2p|soak|computeplan  ladder (default): walk the
+///                           compute-policy fallback ladder per bucket.
+///                           matrix: single-stage compute-unit flips for
+///                           ANE-rejection attribution (coreml arm only; see
+///                           ``BenchRunner/matrixCells``). g2p: time ONLY the
+///                           Misaki G2P pass per input (via
+///                           ``KokoroTTS/phonemizeOnlyForBench``) to bound the
+///                           raw-text-vs-pretokenized boundary asymmetry
+///                           between the two arms numerically. computeplan:
+///                           dump MLComputePlan per-op preferred-device
+///                           counts for one bundled model (--model <name>,
+///                           no extension) — see
+///                           ``BenchRunner/runComputePlanMode()``.
+///   --policy aneGenerator     T5's ANE-generator viability probe: decoder-pre
+///                           and the new kokoro_decoder_har_ane_3s package
+///                           both on CPU+ANE (3s bucket only). See
+///                           ``StagePolicy/aneGenerator``.
 ///   --exact-duration 1      use exact-native-LSTM duration packages
 ///                           (kokoro_duration_exact_tN, 780 ops) instead of
 ///                           the padded unrolled ones (17k-134k ops); mirrors
@@ -125,10 +134,24 @@ struct StagePolicy {
         decoderPre: .cpuAndNeuralEngine, generator: .cpuOnly
     )
 
+    /// T5's ANE-generator viability probe (README/Plans/ane-generator-a14-v1.md
+    /// T5): decoder-pre AND the new `kokoro_decoder_har_ane_3s` generator
+    /// package both requested on CPU+ANE. Duration/f0n are pinned `.cpuOnly`
+    /// on purpose — they are not part of this probe and their unrolled-LSTM
+    /// padded packages are a separate, already-documented compile-memory
+    /// hazard (see `backgroundSafe`'s doc comment). 3s bucket only:
+    /// `BundleModelCache.generatorModel` throws for any other bucket under
+    /// this policy rather than silently falling back to the legacy package.
+    static let aneGenerator = StagePolicy(
+        name: "aneGenerator",
+        duration: .cpuOnly, f0n: .cpuOnly,
+        decoderPre: .cpuAndNeuralEngine, generator: .cpuAndNeuralEngine
+    )
+
     /// Policies addressable by --policy.
     static let named: [String: StagePolicy] = {
         var byName = [String: StagePolicy]()
-        for p in ladder + [cpuAndNeuralEngine, backgroundSafe] { byName[p.name] = p }
+        for p in ladder + [cpuAndNeuralEngine, backgroundSafe, aneGenerator] { byName[p.name] = p }
         return byName
     }()
 }
@@ -236,6 +259,22 @@ final class BundleModelCache: KokoroModelProvider {
 
     func generatorModel(bucketSec: Int) throws -> MLModel {
         lastVendedStage = "generator"
+        if policy.name == "aneGenerator" {
+            // Fail loudly rather than silently falling back to the legacy
+            // package: aneGenerator's whole point is exercising the
+            // ANE-admissible graph, and 3s is the only bucket small enough
+            // to fit under the ANE's 16,384-elements-per-axis limit (see
+            // README/Plans/ane-generator-a14-v1.md Ground Truth).
+            guard bucketSec == 3 else {
+                throw PipelineError.modelNotLoaded(
+                    "aneGenerator policy only supports the 3s bucket (kokoro_decoder_har_ane_3s); got \(bucketSec)s"
+                )
+            }
+            if let m = genModels[bucketSec] { return m }
+            let m = try MLModel(contentsOf: Self.compiledURL("kokoro_decoder_har_ane_3s"), configuration: genConfig)
+            genModels[bucketSec] = m
+            return m
+        }
         if let m = genModels[bucketSec] { return m }
         let m = try MLModel(contentsOf: Self.compiledURL("kokoro_decoder_har_post_\(bucketSec)s"), configuration: genConfig)
         genModels[bucketSec] = m
@@ -444,6 +483,9 @@ final class BenchRunner: ObservableObject {
     static let policyOverride = argValue("--policy")
     /// --soak-seconds N: how long soak mode keeps synthesizing (default 900).
     static let soakSeconds = Double(argValue("--soak-seconds") ?? "900") ?? 900
+    /// --model <name>: bundled .mlmodelc name for --mode computeplan (no
+    /// extension, e.g. "kokoro_decoder_har_ane_3s" or "kokoro_decoder_pre_3s").
+    static let modelOverride = argValue("--model")
     /// Soak mode synthesizes one bucket per run (fresh models per bucket
     /// would re-trigger AOT compiles mid-soak): the first explicit --keys
     /// entry, else 15s (nearest bucket to FreeReader's chunk size).
@@ -522,6 +564,13 @@ final class BenchRunner: ObservableObject {
                 } catch {
                     await self.log("g2p run failed: \(error)")
                     await self.record(["arm": "g2p", "key": "mode-level", "error": String(describing: error)])
+                }
+            } else if Self.mode == "computeplan" {
+                do {
+                    try await self.runComputePlanMode()
+                } catch {
+                    await self.log("computeplan run failed: \(error)")
+                    await self.record(["arm": "computeplan", "key": "mode-level", "error": String(describing: error)])
                 }
             } else {
                 // Arms are isolated: a Core ML failure must not block the MLX
@@ -916,6 +965,77 @@ final class BenchRunner: ObservableObject {
                 "thermal_state": thermalStateName(),
                 "error": failure ?? NSNull(),
             ] as [String: Any])
+        }
+    }
+
+    // MARK: Compute-plan mode (--mode computeplan --model <name>)
+
+    /// Dumps per-op preferred-device counts for one bundled `.mlmodelc` via
+    /// `MLComputePlan` (iOS 17.4+; this app's deployment target is 18.0, see
+    /// project.yml). Xcode's Performance tab only shows an *estimate* — this
+    /// is how the owner verifies real on-device residency for decoder-pre
+    /// (Phase 0) and, later, the ANE generator (see
+    /// README/Plans/ane-generator-a14-v1.md T5 and
+    /// README/Guides/apple-silicon/Kokoro-A14-iPhone-generator-execution-guide.md's
+    /// Python equivalent).
+    nonisolated private func runComputePlanMode() async throws {
+        guard let name = Self.modelOverride else {
+            await log("computeplan: --model <name> is required (bundled .mlmodelc name, no extension)")
+            await record(["arm": "computeplan", "key": "mode-level", "error": "--model not provided"])
+            return
+        }
+        guard let url = Bundle.main.url(forResource: name, withExtension: "mlmodelc") else {
+            await log("computeplan: \(name).mlmodelc not found in bundle")
+            await record(["arm": "computeplan", "key": name, "error": "\(name).mlmodelc not found in bundle"])
+            return
+        }
+        await log("computeplan \(name): loading compute plan (.cpuAndNeuralEngine)")
+        let config = MLModelConfiguration()
+        config.computeUnits = .cpuAndNeuralEngine
+        let plan = try await MLComputePlan.load(contentsOf: url, configuration: config)
+
+        guard case .program(let program) = plan.modelStructure, let mainFunction = program.functions["main"] else {
+            await log("computeplan \(name): not an ML Program — no per-op device usage available")
+            await record(["arm": "computeplan", "key": name, "error": "model is not an ML Program"])
+            return
+        }
+
+        var counts: [String: Int] = [:]
+        var total = 0
+        for op in mainFunction.block.operations {
+            total += 1
+            let label = Self.deviceLabel(plan.deviceUsage(for: op)?.preferred)
+            counts[label, default: 0] += 1
+        }
+        for (device, n) in counts.sorted(by: { $0.key < $1.key }) {
+            let line = "COMPUTEPLAN: \(device): \(n) ops"
+            print(line)
+            await log(line)
+        }
+        let aneCount = counts["neuralEngine"] ?? 0
+        let anePercent = total > 0 ? Double(aneCount) / Double(total) * 100 : 0
+        await log("computeplan \(name): \(aneCount)/\(total) ops on ANE (\(String(format: "%.1f", anePercent))%)")
+        await record([
+            "arm": "computeplan",
+            "key": name,
+            "total_ops": total,
+            "device_counts": counts,
+            "ane_ops": aneCount,
+            "ane_percent": anePercent,
+        ] as [String: Any])
+    }
+
+    /// `MLComputeDevice` is `CustomStringConvertible` but its description is
+    /// the underlying device-object description (verbose, host-specific);
+    /// this gives the stable short label the COMPUTEPLAN: lines and results
+    /// JSON use instead.
+    nonisolated private static func deviceLabel(_ device: MLComputeDevice?) -> String {
+        guard let device else { return "unknown" }
+        switch device {
+        case .cpu: return "cpu"
+        case .gpu: return "gpu"
+        case .neuralEngine: return "neuralEngine"
+        @unknown default: return "unknown"
         }
     }
 

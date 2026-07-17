@@ -60,6 +60,16 @@ for t in "${EXACT[@]}"; do
 done
 for t in "${F0N[@]}"; do copy "kokoro_f0ntrain_t${t}.mlpackage"; done
 
+# T5 (README/Plans/ane-generator-a14-v1.md): ANE-admissible 3s generator
+# package (decoder-har-ane export, T4). Optional like the exact-duration
+# packages above — skip gracefully if not yet exported; --policy aneGenerator
+# just won't be available until it's staged.
+if [ -d "$SRC/kokoro_decoder_har_ane_3s.mlpackage" ]; then
+  copy "kokoro_decoder_har_ane_3s.mlpackage"
+else
+  echo "skipping optional kokoro_decoder_har_ane_3s.mlpackage (not exported; --policy aneGenerator unavailable)"
+fi
+
 if [ "$missing" -ne 0 ]; then
   echo "Some packages are missing from $SRC — export them first." >&2
   exit 1

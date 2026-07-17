@@ -272,6 +272,40 @@ this.
   Unrelated housekeeping: `checkpoints/{config.json,kokoro-v1_0.pth}` were broken
   again at session start; restored per the `.gitignore` procedure.
 
+- 2026-07-17 **T5 COMPLETE** — bench-app plumbing wired, no device run
+  performed (owner-run per protocol). Full writeup:
+  `README/Notes/ane-generator-bench-plumbing-2026-07-17.md`. Key finding:
+  **the ANE package needed no geometry fix.** Reproducing
+  `build_decoder_har_post_inputs_np` at native (`sec=3`, un-doubled) geometry
+  with real inputs showed `x_pre` is ALWAYS 100% real content (240/240) —
+  decoder-pre's internal 2x upsample fully computes it regardless of geometry;
+  T2's "120 of 240" figure was `asr`'s own input axis, a different tensor,
+  not x_pre's output. `har`'s half-fill is real but is a property of the
+  baseline package's oversized 28,801 axis (2x the bucket's native frame
+  count) — the ANE package's pre-trimmed 14,401 axis IS the natural STFT
+  frame count for a 3s bucket, so native geometry fills it completely. Swift
+  already computes this identical geometry and Stage 8's pre-existing
+  `inputShapes(from:)`-driven padding was already a no-op for the ANE
+  package; added a DEBUG assert + `ANEGEN: geometry ...` log line to pin the
+  invariant down, not to fix anything. Also added: `StagePolicy.aneGenerator`
+  (duration/f0n `.cpuOnly`, decoderPre/generator `.cpuAndNeuralEngine`,
+  `BundleModelCache` throws for non-3s buckets under this policy); Stage 9
+  branches on the generator model's own output description (`spec`+`phase`
+  vs `waveform`) to route through T3's `hostISTFTInverse` for the ANE
+  package; a finiteness gate (T4's inheritance — the Mac's ANE miscomputes
+  this graph) that checks every pass, prints a greppable `ANEGEN:` line, and
+  throws `PipelineError.nonFiniteGeneratorOutput` on any non-finite value
+  rather than scheduling NaN audio; `--mode computeplan --model <name>`
+  dumping `MLComputePlan` per-op device counts (Swift API confirmed against
+  the iOS 26 SDK's `CoreML.swiftinterface`, not guessed from the Python
+  sketch); `prepare_resources.sh` stages the ANE package with a graceful
+  skip. Acceptance met: `xcodebuild ... build` succeeded, `swift test`
+  48/48 (T3's goldens untouched). What T5 leaves for the owner: the exact
+  Phase 1 gate / soak / compute-plan commands are in the note's "Exact
+  commands for the owner's device gate" section — the finiteness gate is
+  what makes the phone's admittance-vs-correctness question observable
+  rather than just admittance.
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give
