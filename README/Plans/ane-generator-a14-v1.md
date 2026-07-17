@@ -306,6 +306,25 @@ this.
   what makes the phone's admittance-vs-correctness question observable
   rather than just admittance.
 
+- 2026-07-17 **DEVICE GATE RUN (owner, iPhone 12 Pro)** — A14 verdict:
+  `ANECCompile() FAILED` at load, **but iOS 26 E5RT silently rerouted to CPU
+  and the pipeline ran correctly** (7 iterations, finite output 1.0000,
+  geometry asserts green, gen≈0.74–0.95 s per 3 s ≈ CPU speed — falsifies the
+  "iOS hard-fails where macOS reroutes" lore for pinned CPU+NE). Device log
+  (`log collect --device`) names the failures: `ANECompilerService: We can't
+  do batched group convolution` ×4 (no grouped convs exist in the MIL —
+  ANEC creates them internally while lowering) and the fatal **`Too many
+  fvmlibs (more than 255)`** → `Could not retrieve program`. Calibration:
+  decoder-pre (204 non-const ops) compiles on A14; the ANE generator (~900
+  non-const ops, half of them the manual-AdaIN unroll: 88 reduce_mean, 96
+  tile, 218 add, 146 mul) does not. **A14 rejection is a program-SIZE cap,
+  not an op-type rejection.** Levers for T6: (a) lower each AdaIN1d's manual
+  mean/var chain to MIL `layer_norm` (const γ=1/β=0) + style mul/add — ~3 ops
+  instead of ~11, saves ~350–400 ops; (b) split the package at the rate
+  boundary (stage-1 trunk / stage-2 body) to halve per-program op count;
+  (c) both. Mac-ANE miscompute remains a separate open question — A14 ANE
+  correctness untested until it admits a program.
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give
