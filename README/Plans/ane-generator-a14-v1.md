@@ -188,6 +188,16 @@ this.
   untethered battery soak (`SPIKE_RUNBOOK.md` Test 3b) under
   `--policy aneGenerator`.
 
+## Status log
+
+- 2026-07-16 **T1 COMPLETE** (commit a901019, review-validated). What later
+  tasks inherit: run all Python via `uv run python` (torch pinned 2.5.0,
+  coremltools 8.3.0); `checkpoints/{config.json,kokoro-v1_0.pth}` exist as
+  local HF-cache symlinks (restore procedure in `.gitignore` if broken); the
+  3 s baseline package is already exported and shape-verified at
+  `coreml/kokoro_decoder_har_post_3s.mlpackage` — T3's real-case golden and
+  T4's parity reference should use it, no re-export needed.
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give

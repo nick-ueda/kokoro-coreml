@@ -222,3 +222,6 @@ kokoro.js/voices/*.bin
 # Local scratch notes (not for version control)
 scratchpad.md
 tmp/
+
+# Xcode/SwiftPM IDE state
+swift/.swiftpm/
