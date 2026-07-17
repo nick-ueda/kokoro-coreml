@@ -112,6 +112,13 @@ concern is the model's inherent stochasticity, not this change.
 
 ## Flagged for the owner — geometry, NOT fixed here (out of T2's remit)
 
+> **Correction (2026-07-17, T5):** the x_pre row in the table below is wrong —
+> it conflates `frame_count` (decoder-pre's asr INPUT axis, correctly 120 at
+> native geometry) with x_pre's OUTPUT axis, which decoder-pre's internal 2x
+> upsample always fills completely (240/240 real). Only `har` is half-filled,
+> and only because the baseline package's 28,801 axis is 2x the natural frame
+> count. See `ane-generator-bench-plumbing-2026-07-17.md` for the evidence.
+
 Verified in code while building real inputs; the fix is a separate decision.
 `build_decoder_har_post_inputs_np` derives `full_f0_len` from `bucket_samples`
 (`sec * 24000 / 300`), **not** from the 2x internal geometry the decoder-har
