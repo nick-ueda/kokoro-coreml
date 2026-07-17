@@ -223,5 +223,10 @@ kokoro.js/voices/*.bin
 scratchpad.md
 tmp/
 
+# Local listening clips dropped in Scratchpad/ for owner A/B (same rule as
+# outputs/: WAVs are regenerable, never committed). Regenerate the T2 pre-trim
+# set with scripts/probe_har_pretrim_adain_equivalence.py.
+Scratchpad/*.wav
+
 # Xcode/SwiftPM IDE state
 swift/.swiftpm/

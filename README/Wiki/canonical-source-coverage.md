@@ -1,6 +1,6 @@
 ---
 title: Canonical Source Coverage
-last_synced: 2026-07-15
+last_synced: 2026-07-17
 coverage_index: true
 ---
 
@@ -55,6 +55,7 @@ This is a deterministic coverage index, not a current-belief page. It lists read
 - [README/Notes/Kokoro-strict-source-HAR-contract-folding-deep-research-prompt.md](../Notes/Kokoro-strict-source-HAR-contract-folding-deep-research-prompt.md)
 - [README/Notes/Kokoro-strict-source-HAR-representation-repair-deep-research-prompt.md](../Notes/Kokoro-strict-source-HAR-representation-repair-deep-research-prompt.md)
 - [README/Notes/README.md](../Notes/README.md)
+- [README/Notes/ane-pretrim-equivalence-2026-07-17.md](../Notes/ane-pretrim-equivalence-2026-07-17.md)
 - [README/Notes/apple-silicon-nvme-energy-measurement-create-guide-brief.md](../Notes/apple-silicon-nvme-energy-measurement-create-guide-brief.md)
 - [README/Notes/bakeoff-results-v1.md](../Notes/bakeoff-results-v1.md)
 - [README/Notes/bakeoff-results-v2.md](../Notes/bakeoff-results-v2.md)

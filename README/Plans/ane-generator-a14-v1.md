@@ -207,6 +207,31 @@ this.
   (needs `voices/af_heart.pt`, one HF download). T4's parity check and T5's
   executor wiring should call this — do not reimplement.
 
+- 2026-07-17 **T2 COMPLETE** — verdict **"indistinguishable"**, so T4 is
+  UNGATED. Full writeup:
+  `README/Notes/ane-pretrim-equivalence-2026-07-17.md`; experiment:
+  `scripts/probe_har_pretrim_adain_equivalence.py` (pure PyTorch fp32, real
+  phonemes/BERT/F0/voice inputs). Pre-trim moves the waveform 28.06 dB SNR /
+  0.032 max-abs — 7.6 dB LESS than the shipped graph's own run-to-run
+  variation (20.46 dB; hn-nsf redraws sine phase + noise every render), and
+  ~100% of it is the predicted AdaIN window shift, not a bug. Pre-trim is also
+  better-defined: the original's output swings 12.42 dB (max-abs 0.214, ~60%
+  of peak) on har content it discards, while pre-trim is bit-identical there.
+  WAVs for the owner's ear check (ear check NOT run — no llm-workflows/
+  GEMINI_API_KEY on this Mac): `Scratchpad/t2_har_{original,pretrim}.wav` plus
+  `t2_har_original_noise_redraw.wav` as a positive control.
+
+  **T4 must read the note's "Inheritance for T4" section before writing its
+  parity check**: T4's stated gate (">= 40 dB vs the T1 baseline package's
+  waveform") is UNREACHABLE by design — that package is the *original* graph
+  and T4 exports the *pre-trim* graph, ~28 dB apart on purpose. Gate against a
+  PyTorch pre-trim reference (`_forward_pretrim` in the T2 script) instead, and
+  feed both sides the identical `har` tensor or the hn-nsf RNG collapses the
+  comparison to ~20 dB. Separately flagged, NOT fixed: at runtime
+  `build_decoder_har_post_inputs_np` fills only half of each decoder-har input
+  axis with signal (x_pre 120 of 240, har 14,401 of 28,801) and zero-pads the
+  rest.
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give
