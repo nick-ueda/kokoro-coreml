@@ -4,7 +4,7 @@ from __future__ import annotations
 import argparse
 
 from .convert import export_synthesizers
-from .convert_ane import export_decoder_har_ane
+from .convert_ane import export_decoder_har_ane, export_decoder_har_ane_split
 from .wrappers import CoreMLExportConstants
 
 
@@ -28,7 +28,10 @@ def main() -> None:
         help=(
             "Export mode: 'decoder' (default), 'decoder-har' (post-hn-nsf tail only: x_pre+ref_s+har→waveform), "
             "'decoder-har-ane' (ANE-admissible 3s generator: pre-trimmed har in, spec/phase out, host runs the "
-            "iSTFT — ignores --buckets/--trace_length/--backend), or 'full' (experimental full synthesizer)"
+            "iSTFT — ignores --buckets/--trace_length/--backend), 'decoder-har-ane-ln' (same, with AdaIN1d lowered "
+            "to layer_norm to shrink the program below the A14's fvmlib cap — T6), 'decoder-har-ane-split' (T6: two "
+            "ln-lowered packages split at the 2,400-frame rate boundary, Mac-verified only), or 'full' (experimental "
+            "full synthesizer)"
         ),
     )
     parser.add_argument(
@@ -44,13 +47,22 @@ def main() -> None:
     args = parser.parse_args()
 
     try:
-        if (args.mode or "").strip().lower() == "decoder-har-ane":
+        mode_norm = (args.mode or "").strip().lower()
+        if mode_norm == "decoder-har-ane-split":
+            # Two ln-lowered packages split at the 2,400-frame rate boundary (T6).
+            export_decoder_har_ane_split(
+                args.output_dir,
+                precision=args.precision,
+                rewrite_ups_conv_transpose=not args.no_rewrite_ups_conv_transpose,
+            )
+        elif mode_norm in ("decoder-har-ane", "decoder-har-ane-ln"):
             # 3 s only and geometry-derived, so --buckets/--trace_length/--backend
             # have nothing to configure here (see export_synth/convert_ane.py).
             export_decoder_har_ane(
                 args.output_dir,
                 precision=args.precision,
                 rewrite_ups_conv_transpose=not args.no_rewrite_ups_conv_transpose,
+                lower_adain_layernorm=mode_norm == "decoder-har-ane-ln",
             )
         else:
             export_synthesizers(

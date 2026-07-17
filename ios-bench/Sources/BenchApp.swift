@@ -32,6 +32,10 @@
 ///                           and the new kokoro_decoder_har_ane_3s package
 ///                           both on CPU+ANE (3s bucket only). See
 ///                           ``StagePolicy/aneGenerator``.
+///   --generator-package <n>   override the aneGenerator generator package
+///                           (default kokoro_decoder_har_ane_3s) — walk T6's
+///                           candidates (kokoro_decoder_har_ane_ln_3s, ...) in
+///                           one session. See BenchRunner.generatorPackageOverride.
 ///   --exact-duration 1      use exact-native-LSTM duration packages
 ///                           (kokoro_duration_exact_tN, 780 ops) instead of
 ///                           the padded unrolled ones (17k-134k ops); mirrors
@@ -175,8 +179,16 @@ final class BundleModelCache: KokoroModelProvider {
     /// via --exact-duration; semantics match
     /// KokoroPipeline.discoverDurationChoices (no attention mask, no padding).
     static let exactDurationSizes = [44, 105, 219, 476]
+    /// Default generator package for the `aneGenerator` policy. Overridable per
+    /// launch via `--generator-package <name>` (BenchRunner.generatorPackageOverride)
+    /// so the owner can walk T6's candidate packages — `kokoro_decoder_har_ane_ln_3s`
+    /// (layer_norm-lowered), etc. — in one device session without re-installing.
+    static let defaultANEGeneratorPackage = "kokoro_decoder_har_ane_3s"
 
     let policy: StagePolicy
+    /// Bundled .mlmodelc name (no extension) the `aneGenerator` policy loads for
+    /// the generator stage. Defaults to `defaultANEGeneratorPackage`.
+    private let aneGeneratorPackage: String
     /// Stage family of the most recently vended model. When an ANEF compile
     /// fails at first predict, this is the best in-process hint for which
     /// stage threw; definitive attribution comes from --mode matrix.
@@ -191,8 +203,9 @@ final class BundleModelCache: KokoroModelProvider {
     private var decPreModels: [Int: MLModel] = [:]
     private var genModels: [Int: MLModel] = [:]
 
-    init(policy: StagePolicy, useExactDuration: Bool) {
+    init(policy: StagePolicy, useExactDuration: Bool, generatorPackage: String? = nil) {
         self.policy = policy
+        self.aneGeneratorPackage = generatorPackage ?? Self.defaultANEGeneratorPackage
         func cfg(_ u: MLComputeUnits) -> MLModelConfiguration {
             let c = MLModelConfiguration(); c.computeUnits = u; return c
         }
@@ -267,11 +280,11 @@ final class BundleModelCache: KokoroModelProvider {
             // README/Plans/ane-generator-a14-v1.md Ground Truth).
             guard bucketSec == 3 else {
                 throw PipelineError.modelNotLoaded(
-                    "aneGenerator policy only supports the 3s bucket (kokoro_decoder_har_ane_3s); got \(bucketSec)s"
+                    "aneGenerator policy only supports the 3s bucket (\(aneGeneratorPackage)); got \(bucketSec)s"
                 )
             }
             if let m = genModels[bucketSec] { return m }
-            let m = try MLModel(contentsOf: Self.compiledURL("kokoro_decoder_har_ane_3s"), configuration: genConfig)
+            let m = try MLModel(contentsOf: Self.compiledURL(aneGeneratorPackage), configuration: genConfig)
             genModels[bucketSec] = m
             return m
         }
@@ -486,6 +499,12 @@ final class BenchRunner: ObservableObject {
     /// --model <name>: bundled .mlmodelc name for --mode computeplan (no
     /// extension, e.g. "kokoro_decoder_har_ane_3s" or "kokoro_decoder_pre_3s").
     static let modelOverride = argValue("--model")
+    /// --generator-package <name>: override which bundled package the
+    /// `aneGenerator` policy loads for the generator stage (default:
+    /// `kokoro_decoder_har_ane_3s`). Lets the owner walk T6's candidate packages
+    /// — e.g. `kokoro_decoder_har_ane_ln_3s` (layer_norm-lowered, ~35% fewer ops)
+    /// — in one device session. See README/Plans/ane-generator-a14-v1.md T6.
+    static let generatorPackageOverride = argValue("--generator-package")
     /// Soak mode synthesizes one bucket per run (fresh models per bucket
     /// would re-trigger AOT compiles mid-soak): the first explicit --keys
     /// entry, else 15s (nearest bucket to FreeReader's chunk size).
@@ -706,7 +725,7 @@ final class BenchRunner: ObservableObject {
         // fails restarts lower on the ladder with a fresh cache.
         let ladder = Self.activeLadder
         var ladderIndex = 0
-        var cache = BundleModelCache(policy: ladder[ladderIndex], useExactDuration: Self.exactDuration)
+        var cache = BundleModelCache(policy: ladder[ladderIndex], useExactDuration: Self.exactDuration, generatorPackage: Self.generatorPackageOverride)
 
         for key in Self.keys {
             let input = try await MainActor.run { try self.loadInput(key) }
@@ -727,7 +746,7 @@ final class BenchRunner: ObservableObject {
                     await recordFailure(key: key, policyName: policy.name, cache: cache, error: error)
                     if ladderIndex + 1 < ladder.count {
                         ladderIndex += 1
-                        cache = BundleModelCache(policy: ladder[ladderIndex], useExactDuration: Self.exactDuration)
+                        cache = BundleModelCache(policy: ladder[ladderIndex], useExactDuration: Self.exactDuration, generatorPackage: Self.generatorPackageOverride)
                     } else {
                         failure = String(describing: error)
                         break
@@ -789,7 +808,7 @@ final class BenchRunner: ObservableObject {
                 let input = try await MainActor.run { try self.loadInput(key) }
                 // Fresh cache per cell+bucket: no state leaks across cells,
                 // and only one bucket's models are resident on the 4 GB phone.
-                let cache = BundleModelCache(policy: cell.policy, useExactDuration: Self.exactDuration)
+                let cache = BundleModelCache(policy: cell.policy, useExactDuration: Self.exactDuration, generatorPackage: Self.generatorPackageOverride)
                 await log("matrix \(key) policy=\(cell.policy.name): loading (first load can take many minutes — ANE AOT compile)")
                 do {
                     let series = try await runWarmSeries(input, weights: weights, cache: cache, key: key, policyName: cell.policy.name)
@@ -830,7 +849,7 @@ final class BenchRunner: ObservableObject {
         let key = Self.soakKey
         let weights = try loadHnsfWeights()
         let input = try await MainActor.run { try self.loadInput(key) }
-        let cache = BundleModelCache(policy: policy, useExactDuration: Self.exactDuration)
+        let cache = BundleModelCache(policy: policy, useExactDuration: Self.exactDuration, generatorPackage: Self.generatorPackageOverride)
         let player = SoakPlayer()
         let csv = SoakCSVLogger()
         Self.seedLaunchArgsFileIfMissing()

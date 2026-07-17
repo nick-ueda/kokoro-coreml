@@ -325,6 +325,42 @@ this.
   (c) both. Mac-ANE miscompute remains a separate open question — A14 ANE
   correctness untested until it admits a program.
 
+- 2026-07-17 **T6 COMPLETE** — the manual-AdaIN unroll shrunk, and the graph
+  optionally split, both Mac-verified; NO A14 admittance claimed. Full writeup:
+  `README/Notes/ane-generator-layernorm-shrink-2026-07-17.md`. Lever (a),
+  layer_norm: every `AdaIN1d` manual mean/var chain lowered to a single MIL
+  `layer_norm` via an export-time module swap (`lower_generator_adain_to_layernorm`
+  + `AdaIN1dLayerNorm` in `export_synth/wrappers.py`; `kokoro/istftnet.py`
+  untouched), CLI `--mode decoder-har-ane-ln` -> `kokoro_decoder_har_ane_ln_3s`,
+  gate `scripts/verify_decoder_har_ane_ln.py`. Census **1,039 -> 679 non-const
+  (34.6% fewer)**; `reduce_mean` 88->0, `tile` 96->0, `layer_norm` 0->44, and
+  ZERO manual-norm primitives survive (no decomposition — the plan's stop
+  condition, cleared). Note the module count is 48 but coremltools keeps only 44
+  normalization chains in BOTH the manual and lowered graph (input-independent),
+  so the lowering is a clean 1:1 replacement of exactly the 44 that exist.
+  Waveform allclose to T4's manual graph at max-abs **1.71e-6** (109.59 dB);
+  `spec`/`phase` differ by exp-amplified ulps (2.2e-5 / 1.4e-5), so the gate is on
+  the waveform. Parity **46.14 dB** CPU_AND_GPU (gate 40); `CPU_AND_NE`
+  still non-finite on this Mac (T4's Mac-ANE miscompute, unchanged — GPU proves
+  the graph); ANE residency **97.1%** (659/679). Lever (c), the rate-boundary
+  split: because 679 > the ~300 secondary trigger, also exported two ln-lowered
+  packages split at the 2,400-frame trunk (`--mode decoder-har-ane-split` ->
+  `kokoro_decoder_har_ane_ln_{trunk,body}_3s`, gate
+  `scripts/verify_decoder_har_ane_split.py`): **337 / 346 non-const** (largest
+  half below the ~350 target), chained parity **46.02 dB**, chain bit-identical to
+  the monolithic ln (1.71e-6). Split is Mac-verified ONLY — not wired into the
+  Swift executor (follow-on if the phone rejects the single ln package). Bench:
+  `--generator-package <name>` overrides the `aneGenerator` generator stage
+  (default unchanged); ln package + both split halves staged into
+  `ios-bench/Resources/coreml/` with a `prepare_resources.sh` optional-copy hunk;
+  `xcodebuild ... build` SUCCEEDED, `swift test` 48/48. **Owner's device ladder**
+  (exact scheme args in the note): rung 1 `--policy aneGenerator
+  --generator-package kokoro_decoder_har_ane_ln_3s` (+ `--mode computeplan --model
+  kokoro_decoder_har_ane_ln_3s`); rung 2, only if rung 1 still hits the fvmlib
+  cap, `--mode computeplan --model kokoro_decoder_har_ane_ln_{trunk,body}_3s` to
+  probe each half's compile individually. The census is a Mac-side proxy for the
+  fvmlib object count — the phone is the judge (Phase 1 gate).
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give

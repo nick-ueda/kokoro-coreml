@@ -70,6 +70,22 @@ else
   echo "skipping optional kokoro_decoder_har_ane_3s.mlpackage (not exported; --policy aneGenerator unavailable)"
 fi
 
+# T6 (README/Plans/ane-generator-a14-v1.md): candidate ANE generator packages
+# that shrink the program below the A14's fvmlib object cap. The ln package is
+# a drop-in for --policy aneGenerator via --generator-package; the trunk/body
+# split halves are single-half compute-plan candidates (--mode computeplan
+# --model <name>). All optional — skip gracefully like the T5 package above.
+for name in \
+  kokoro_decoder_har_ane_ln_3s \
+  kokoro_decoder_har_ane_ln_trunk_3s \
+  kokoro_decoder_har_ane_ln_body_3s; do
+  if [ -d "$SRC/${name}.mlpackage" ]; then
+    copy "${name}.mlpackage"
+  else
+    echo "skipping optional ${name}.mlpackage (not exported; T6 candidate)"
+  fi
+done
+
 if [ "$missing" -ne 0 ]; then
   echo "Some packages are missing from $SRC — export them first." >&2
   exit 1

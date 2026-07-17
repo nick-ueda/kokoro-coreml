@@ -262,6 +262,236 @@ class GeneratorFromHarANE(nn.Module):
         return spec, phase
 
 
+def _run_generator_stage(
+    gen: nn.Module, x: torch.Tensor, s: torch.Tensor, har: torch.Tensor, i: int
+) -> torch.Tensor:
+    """Run ONE upsample stage ``i`` of the pre-trim generator loop and return ``x``.
+
+    This is the exact body of ``GeneratorFromHarANE.forward``'s ``for i`` loop,
+    factored out so the rate-boundary split (``GeneratorTrunkANE`` /
+    ``GeneratorBodyANE``, task T6) is a faithful transcription rather than a
+    re-derivation. The chained split is parity-gated against ``_forward_pretrim``,
+    which is what actually protects against drift, but sharing this helper keeps
+    the two paths honest by construction.
+
+    Pre-trim ordering (README/Notes/ane-pretrim-equivalence-2026-07-17.md): the
+    ``x_source`` crop happens BEFORE ``noise_res[i]``, so AdaIN never sees a
+    har-length tensor.
+    """
+    x = F.leaky_relu(x, negative_slope=0.1)
+    x_source = gen.noise_convs[i](har)
+    x = gen.ups[i](x)
+    if i == gen.num_upsamples - 1:
+        x = gen.reflection_pad(x)
+    tx = x.size(2)
+    ts = x_source.size(2)
+    if ts < tx:
+        x_source = F.pad(x_source, (0, tx - ts))
+    elif ts > tx:
+        x_source = x_source[:, :, :tx]
+    x_source = gen.noise_res[i](x_source, s)
+    x = x + x_source
+    xs = None
+    for j in range(gen.num_kernels):
+        block = gen.resblocks[i * gen.num_kernels + j]
+        xs = block(x, s) if xs is None else xs + block(x, s)
+    return xs / gen.num_kernels
+
+
+class GeneratorTrunkANE(nn.Module):
+    """Rate-boundary split, stage 1 of 2 (task T6): x_pre/ref_s/har -> the 2,400-frame trunk.
+
+    Runs ONLY the first upsample stage of ``GeneratorFromHarANE`` (``ups[0]`` ×10,
+    240 -> 2,400), returning the tensor the second stage consumes. Exists to halve
+    the per-program op count: the A14 device gate rejected the monolithic ANE
+    generator with ``Too many fvmlibs (>255)`` — a program-SIZE cap — so splitting
+    the graph at the 240->2,400->14,401 rate boundary yields two smaller programs,
+    each independently below the cap (the phone is the judge; see the Status log).
+
+    Pairs with ``GeneratorBodyANE``. Chaining the two must reproduce
+    ``GeneratorFromHarANE`` (== ``_forward_pretrim``); ``scripts/verify_decoder_har_ane_split.py``
+    asserts that on real inputs. Intended for the ln-lowered generator (T6), but the
+    split is orthogonal to the lowering and works on either.
+
+    Inputs:
+        x_pre: ``(B, 512, 240)`` at 3 s. ref_s: ``(B, 256)``. har: ``(B, 22, 14,401)``.
+    Returns:
+        trunk: ``(B, 256, 2,400)`` at 3 s.
+
+    Called by:
+        - ``export_synth.convert_ane.export_decoder_har_ane_split``.
+    """
+
+    def __init__(self, generator: nn.Module) -> None:
+        super().__init__()
+        if int(generator.num_upsamples) != 2:
+            raise ValueError(
+                f"split assumes a 2-stage generator (trunk|body); got "
+                f"num_upsamples={int(generator.num_upsamples)}"
+            )
+        self.generator = generator
+
+    def forward(self, x_pre: torch.Tensor, ref_s: torch.Tensor, har: torch.Tensor) -> torch.Tensor:
+        s = ref_s[:, : CoreMLExportConstants.VOICE_BASELINE_DIM]
+        return _run_generator_stage(self.generator, x_pre, s, har, 0)
+
+
+class GeneratorBodyANE(nn.Module):
+    """Rate-boundary split, stage 2 of 2 (task T6): trunk/ref_s/har -> spec/phase.
+
+    Runs the SECOND upsample stage of ``GeneratorFromHarANE`` (``ups[1]`` ×6,
+    2,400 -> 14,400 -> ``reflection_pad`` 14,401) plus ``conv_post`` and the
+    ``exp``/``sin`` split, returning the same ``spec``/``phase`` the monolithic
+    ANE package emits. See ``GeneratorTrunkANE`` for why the graph is split.
+
+    Inputs:
+        trunk: ``(B, 256, 2,400)`` — ``GeneratorTrunkANE``'s output.
+        ref_s: ``(B, 256)``. har: ``(B, 22, 14,401)`` — the SAME har the trunk saw
+        (``noise_convs[1]`` is k=1, so it reads har at body length).
+    Returns:
+        ``(spec, phase)``, each ``(B, 11, 14,401)`` at 3 s.
+
+    Called by:
+        - ``export_synth.convert_ane.export_decoder_har_ane_split``.
+    """
+
+    def __init__(self, generator: nn.Module) -> None:
+        super().__init__()
+        if int(generator.num_upsamples) != 2:
+            raise ValueError(
+                f"split assumes a 2-stage generator (trunk|body); got "
+                f"num_upsamples={int(generator.num_upsamples)}"
+            )
+        self.generator = generator
+
+    def forward(
+        self, trunk: torch.Tensor, ref_s: torch.Tensor, har: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        s = ref_s[:, : CoreMLExportConstants.VOICE_BASELINE_DIM]
+        gen = self.generator
+        x = _run_generator_stage(gen, trunk, s, har, 1)
+        x = F.leaky_relu(x)
+        x = gen.conv_post(x)
+        spec = torch.exp(x[:, : gen.post_n_fft // 2 + 1, :])
+        phase = torch.sin(x[:, gen.post_n_fft // 2 + 1 :, :])
+        return spec, phase
+
+
+class AdaIN1dLayerNorm(nn.Module):
+    """``AdaIN1d`` (kokoro/istftnet.py) with its instance-norm lowered to one MIL op.
+
+    Task T6 of README/Plans/ane-generator-a14-v1.md. Same math, far fewer ops.
+
+    WHY THIS EXISTS
+    ---------------
+    The A14 device gate (Status log 2026-07-17 "DEVICE GATE RUN") rejected the
+    ANE generator with ``Too many fvmlibs (more than 255)`` — a program-SIZE cap,
+    not an op-type rejection. The single largest contributor to that size is the
+    manual mean/var normalization inside ``AdaIN1d``, unrolled 48 times across the
+    generator. Per application the shipped chain traces to ~11 MIL ops
+    (``reduce_mean`` x2, ``sub``, ``square``, ``sqrt``, ``real_div``, plus two
+    ``tile`` from the ``gamma``/``beta`` ``.expand``). This module computes the
+    identical result with a single ``layer_norm`` and pure broadcasting.
+
+    THE MATH IS THE SAME (proven, not asserted by hope)
+    ---------------------------------------------------
+    ``AdaIN1d`` normalizes each ``(batch, channel)`` row over the time axis with
+    the BIASED variance and ``eps`` inside the sqrt::
+
+        (x - x.mean(dim=2)) / sqrt(x.var(dim=2, unbiased=False) + eps)
+
+    ``F.layer_norm(x, normalized_shape=(T,), eps=eps)`` normalizes over the last
+    ``len(normalized_shape) == 1`` axis — exactly that time axis — with the same
+    biased variance and the same in-sqrt ``eps``. The two differ only by fp ulps
+    (measured max-abs ~7e-7 on random input, well under T6's 1e-5 allclose gate).
+    coremltools maps that call to exactly ONE ``layer_norm`` MIL op; it does not
+    decompose back to primitives (verified before this landed).
+
+    The style projection is untouched: the same trained ``fc`` produces
+    ``gamma``/``beta`` of shape ``(B, C, 1)``, and ``(1 + gamma) * x_norm + beta``
+    broadcasts over time with NO explicit ``expand``/``tile``/``repeat`` — the two
+    ``tile`` ops per application vanish for free.
+
+    NOT a drop-in for training: it reuses the source module's live ``fc`` (shared
+    parameter, not a copy) and is only ever constructed by
+    ``lower_generator_adain_to_layernorm`` at export time on an already-loaded,
+    eval-mode generator.
+
+    Constructed by:
+        - ``lower_generator_adain_to_layernorm`` (below), the only caller.
+    """
+
+    def __init__(self, source: nn.Module) -> None:
+        super().__init__()
+        # source is an AdaIN1d (matched by class name — the export-time file
+        # loader gives it a class identity distinct from a normal import, so
+        # isinstance would miss it; see lower_generator_adain_to_layernorm).
+        self.num_features = int(source.num_features)
+        self.eps = float(source.eps)
+        self.fc = source.fc  # reuse the trained style projection, same weights
+
+    def forward(self, x: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+        # x: (B, C, T), s: (B, style_dim). Normalize each channel over time with
+        # one op; layer_norm over the last axis == AdaIN1d's instance norm.
+        B = x.shape[0]
+        x_norm = F.layer_norm(x, (x.shape[-1],), eps=self.eps)
+        h = self.fc(s).view(B, 2 * self.num_features, 1)
+        gamma, beta = torch.chunk(h, chunks=2, dim=1)  # each (B, C, 1)
+        # Broadcast over time — no explicit expand/tile (that is the point).
+        return (1.0 + gamma) * x_norm + beta
+
+
+def lower_generator_adain_to_layernorm(generator: nn.Module) -> int:
+    """Replace every ``AdaIN1d`` in ``generator`` with ``AdaIN1dLayerNorm``, in place.
+
+    Task T6. Mutates the generator so that ``GeneratorFromHarANE.forward`` — which
+    reaches AdaIN only indirectly, through ``gen.noise_res[i]`` and
+    ``gen.resblocks[...]`` — emits ``layer_norm`` instead of the manual mean/var
+    unroll, WITHOUT any edit to kokoro/istftnet.py. The wrapper is unchanged; only
+    the leaf normalization modules are swapped.
+
+    The generator holds 48 ``AdaIN1d`` (2 ``noise_res`` + 6 ``resblocks``, each an
+    ``AdaINResBlock1`` with ``adain1``/``adain2`` ModuleLists of 3), so this
+    removes ~48 * 8 = ~380 boundary-shaping ops — the T6 lever the A14 device gate
+    pointed at.
+
+    Matched by CLASS NAME, not ``isinstance``: ``load_kokoro_for_export``
+    (kokoro/_export_utils.py) imports istftnet from file, giving its ``AdaIN1d`` a
+    class object distinct from ``from kokoro.istftnet import AdaIN1d`` — the same
+    re-import identity trap ``_is_masked_bidirectional_lstm`` works around.
+
+    Idempotent: an already-lowered generator (holding ``AdaIN1dLayerNorm``) is left
+    alone and contributes 0 to the count.
+
+    - Parameter generator: the loaded ``kmodel.decoder.generator`` (or the one
+      inside a ``GeneratorFromHarANE``). Mutated in place.
+    - Returns: number of ``AdaIN1d`` modules replaced.
+
+    Called by:
+        - ``export_synth.convert_ane.export_decoder_har_ane`` when
+          ``lower_adain_layernorm=True`` (the ``decoder-har-ane-ln`` CLI mode).
+        - ``scripts/verify_decoder_har_ane_ln.py`` — the pre-conversion allclose
+          gate that proves this lowering matches the manual chain.
+    """
+    targets = [
+        name
+        for name, module in generator.named_modules()
+        if type(module).__name__ == "AdaIN1d"
+    ]
+    for dotted_name in targets:
+        parts = dotted_name.split(".")
+        parent = generator
+        for part in parts[:-1]:
+            parent = parent[int(part)] if part.isdigit() else getattr(parent, part)
+        source = parent[int(parts[-1])] if parts[-1].isdigit() else getattr(parent, parts[-1])
+        replacement = AdaIN1dLayerNorm(source)
+        if parts[-1].isdigit():
+            parent[int(parts[-1])] = replacement
+        else:
+            setattr(parent, parts[-1], replacement)
+    return len(targets)
+
+
 class CoreMLFriendlyTextEncoder(nn.Module):
     """Replaces the original TextEncoder to avoid pack_padded_sequence."""
     def __init__(self, original_encoder):

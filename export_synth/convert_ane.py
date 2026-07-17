@@ -55,7 +55,10 @@ from kokoro.coreml_export_verify import (
 from .convert import prepare_pytorch_models
 from .wrappers import (
     CoreMLExportConstants,
+    GeneratorBodyANE,
     GeneratorFromHarANE,
+    GeneratorTrunkANE,
+    lower_generator_adain_to_layernorm,
     rewrite_generator_ups_conv_transpose,
 )
 
@@ -73,6 +76,12 @@ EXPECTED_ASR_FRAMES = 240
 EXPECTED_FULL_F0_LEN = 480
 EXPECTED_NATURAL_HAR_FRAMES = 28_801  # what the shipped decoder-har package takes
 EXPECTED_BODY_FRAMES = 14_401  # trimmed har length == spec/phase length
+
+# Rate-boundary split (task T6): the trunk tensor handed from stage 1 to stage 2.
+# After ups[0] (×10) and its resblocks, x is (1, 256, 2,400) at 3 s — the natural
+# seam between the 240->2,400 and 2,400->14,401 rate regions. Asserted at export.
+EXPECTED_TRUNK_CHANNELS = 256
+EXPECTED_TRUNK_FRAMES = 2_400
 
 
 def _derive_geometry(kmodel: torch.nn.Module) -> dict:
@@ -155,6 +164,7 @@ def export_decoder_har_ane(
     *,
     precision: str | None = None,
     rewrite_ups_conv_transpose: bool = True,
+    lower_adain_layernorm: bool = False,
 ) -> str:
     """Export the ANE-admissible 3 s generator to ``kokoro_decoder_har_ane_3s.mlpackage``.
 
@@ -164,16 +174,21 @@ def export_decoder_har_ane(
     admissible bucket to pass.
 
     Called by:
-        - ``export_synth.main`` when ``--mode decoder-har-ane``.
+        - ``export_synth.main`` when ``--mode decoder-har-ane`` (manual AdaIN) or
+          ``--mode decoder-har-ane-ln`` (``lower_adain_layernorm=True``).
 
     Verified by:
-        - ``scripts/verify_decoder_har_ane.py`` — asserts the traced wrapper
-          against T2's PyTorch pre-trim reference (>= 40 dB SNR through the
-          Python iSTFT) and dumps the MLComputePlan op-device split. This
-          function deliberately does NOT gate on numerics: a shape/finiteness
-          smoke test on synthetic har (what ``convert.py``'s decoder-har mode
-          does) is not evidence of anything, because the generator's output is
-          ``exp()``-scaled and degenerate inputs make fp16 error meaningless.
+        - ``scripts/verify_decoder_har_ane.py`` (manual variant) — asserts the
+          traced wrapper against T2's PyTorch pre-trim reference (>= 40 dB SNR
+          through the Python iSTFT) and dumps the MLComputePlan op-device split.
+        - ``scripts/verify_decoder_har_ane_ln.py`` (``lower_adain_layernorm``
+          variant, T6) — the same parity gate PLUS an allclose check of the
+          lowered wrapper vs the manual ``GeneratorFromHarANE`` and a MIL op
+          census proving each AdaIN collapsed to one ``layer_norm``.
+        This function deliberately does NOT gate on numerics: a shape/finiteness
+        smoke test on synthetic har (what ``convert.py``'s decoder-har mode does)
+        is not evidence of anything, because the generator's output is
+        ``exp()``-scaled and degenerate inputs make fp16 error meaningless.
 
     - Parameter output_dir: directory for the .mlpackage. Created if absent.
     - Parameter precision: ``'float16'``/``'fp16'`` (default, and what the A14
@@ -183,6 +198,11 @@ def export_decoder_har_ane(
       of the generator's ConvTranspose1d upsamples. Defaults ON here (the
       decoder-har CLI defaults it off) because this export exists for the ANE
       and the rewrite is part of the graph shape being tested.
+    - Parameter lower_adain_layernorm: lower every ``AdaIN1d`` manual mean/var
+      chain to a single MIL ``layer_norm`` (task T6, to shrink the program below
+      the A14's fvmlib object cap). Saves to ``kokoro_decoder_har_ane_ln_3s.mlpackage``
+      instead of ``kokoro_decoder_har_ane_3s.mlpackage``. Numerically identical to
+      the manual chain up to fp ulps (see ``AdaIN1dLayerNorm`` in wrappers.py).
     - Returns: path to the saved .mlpackage.
     """
     precision_norm = (precision or "").strip().lower()
@@ -219,6 +239,12 @@ def export_decoder_har_ane(
         print(
             f"decoder-har-ane graph rewrite: replaced {rewritten} main "
             "ConvTranspose1d upsample layers with zero-insert conv1d"
+        )
+    if lower_adain_layernorm:
+        lowered = lower_generator_adain_to_layernorm(gen_from_har.generator)
+        print(
+            f"decoder-har-ane-ln graph rewrite: lowered {lowered} AdaIN1d manual "
+            "mean/var chains to single layer_norm ops (T6 fvmlib shrink)"
         )
 
     print(f"[{time.ctime()}] Tracing model with torch.jit.trace...")
@@ -265,12 +291,158 @@ def export_decoder_har_ane(
     assert_no_cpu_fallback_in_logs(convert_buf.getvalue(), phase="decoder-har-ane ct.convert")
     print(f"[{time.ctime()}] Core ML conversion complete.")
 
-    output_path = os.path.join(output_dir, f"kokoro_decoder_har_ane_{BUCKET_SECONDS}s.mlpackage")
+    variant_suffix = "_ln" if lower_adain_layernorm else ""
+    output_path = os.path.join(
+        output_dir, f"kokoro_decoder_har_ane{variant_suffix}_{BUCKET_SECONDS}s.mlpackage"
+    )
     mlmodel.save(output_path)
     print(f"✅ Saved ANE generator to: {output_path}")
+    verify_script = (
+        "scripts/verify_decoder_har_ane_ln.py"
+        if lower_adain_layernorm
+        else "scripts/verify_decoder_har_ane.py"
+    )
     print(
-        "   Next: uv run python scripts/verify_decoder_har_ane.py "
+        f"   Next: uv run python {verify_script} "
         "(parity + compute plan). ANE admittance itself is proven on the phone, "
         "never on this Mac — macOS silently reroutes graphs the ANE rejects."
     )
     return output_path
+
+
+def export_decoder_har_ane_split(
+    output_dir: str = "coreml",
+    *,
+    precision: str | None = None,
+    rewrite_ups_conv_transpose: bool = True,
+    lower_adain_layernorm: bool = True,
+) -> tuple[str, str]:
+    """Export the ANE generator as TWO packages split at the 2,400-frame rate boundary (task T6).
+
+    The A14 device gate rejected the monolithic ANE generator with ``Too many
+    fvmlibs (>255)`` — a program-SIZE cap (Status log, DEVICE GATE RUN). The
+    layer_norm lowering (``export_decoder_har_ane(lower_adain_layernorm=True)``)
+    cuts the program ~35%, but if that still exceeds the cap the next lever is to
+    split the graph so no single program is as large. This produces:
+
+    - ``kokoro_decoder_har_ane_ln_trunk_3s.mlpackage``: x_pre/ref_s/har -> trunk
+      ``(1, 256, 2,400)`` — the first upsample stage (``ups[0]`` ×10).
+    - ``kokoro_decoder_har_ane_ln_body_3s.mlpackage``: trunk/ref_s/har ->
+      spec/phase ``(1, 11, 14,401)`` — the second stage + ``conv_post``.
+
+    Both are layer_norm-lowered by default (the combined lever). Chaining them
+    reproduces ``GeneratorFromHarANE`` exactly; ``scripts/verify_decoder_har_ane_split.py``
+    parity-gates the chain against ``_forward_pretrim`` on the Mac. This is a
+    Mac-side verification artifact and a per-half A14 compute-plan candidate — it
+    is NOT wired into the Swift executor (that is a follow-on task if the phone
+    rejects the single ln package; see plan T6).
+
+    Called by:
+        - ``export_synth.main`` when ``--mode decoder-har-ane-split``.
+
+    - Returns: ``(trunk_path, body_path)``.
+    """
+    if precision is not None and (precision or "").strip().lower() in ("float32", "fp32"):
+        chosen_precision = ct.precision.FLOAT32
+    elif (precision or "").strip().lower() in ("", "float16", "fp16"):
+        chosen_precision = ct.precision.FLOAT16
+    else:
+        raise ValueError(f"unsupported precision {precision!r}; use 'fp16' or 'fp32'")
+
+    print("--- Loading Model ---")
+    kmodel = prepare_pytorch_models("checkpoints/config.json", "checkpoints/kokoro-v1_0.pth")
+    kmodel.eval()
+    os.makedirs(output_dir, exist_ok=True)
+
+    geometry = _derive_geometry(kmodel)
+    frame_count = geometry["frame_count"]
+    body_frames = geometry["body_frames"]
+
+    generator = kmodel.decoder.generator
+    if rewrite_ups_conv_transpose:
+        rewritten = rewrite_generator_ups_conv_transpose(generator)
+        print(f"split graph rewrite: replaced {rewritten} ConvTranspose1d upsamples with zero-insert conv1d")
+    if lower_adain_layernorm:
+        lowered = lower_generator_adain_to_layernorm(generator)
+        print(f"split graph rewrite: lowered {lowered} AdaIN1d chains to layer_norm")
+
+    trunk_wrapper = GeneratorTrunkANE(generator).eval()
+    body_wrapper = GeneratorBodyANE(generator).eval()
+
+    x_pre_shape = (1, geometry["dec_out_ch"], frame_count)
+    ref_s_shape = (1, CoreMLExportConstants.VOICE_EMBEDDING_DIM)
+    har_shape = (1, geometry["har_c"], body_frames)
+    trunk_shape = (1, EXPECTED_TRUNK_CHANNELS, EXPECTED_TRUNK_FRAMES)
+
+    zeros = lambda shape: torch.zeros(shape, dtype=torch.float32)
+    torch.manual_seed(0)
+    with torch.no_grad():
+        trunk_out = trunk_wrapper(zeros(x_pre_shape), zeros(ref_s_shape), zeros(har_shape))
+        actual_trunk = tuple(int(d) for d in trunk_out.shape)
+        if actual_trunk != trunk_shape:
+            raise ValueError(f"trunk shape {actual_trunk}, expected {trunk_shape} (geometry drift)")
+        spec_out, phase_out = body_wrapper(zeros(trunk_shape), zeros(ref_s_shape), zeros(har_shape))
+        expected_bins = int(generator.post_n_fft // 2 + 1)
+        for label, tensor in (("spec", spec_out), ("phase", phase_out)):
+            actual = tuple(int(d) for d in tensor.shape)
+            if actual != (1, expected_bins, body_frames):
+                raise ValueError(f"body {label} shape {actual}, expected {(1, expected_bins, body_frames)}")
+
+    print(f"split geometry: x_pre {x_pre_shape} + har {har_shape} -> trunk {trunk_shape} -> spec/phase (1, {expected_bins}, {body_frames})")
+
+    def _convert(traced, inputs, outputs, name):
+        with capture_ane_logs() as buf:
+            ml = ct.convert(
+                traced,
+                inputs=inputs,
+                outputs=outputs,
+                convert_to="mlprogram",
+                minimum_deployment_target=ct.target.macOS13,
+                compute_precision=chosen_precision,
+                compute_units=ct.ComputeUnit.ALL,
+            )
+        assert_no_cpu_fallback_in_logs(buf.getvalue(), phase=f"split {name} ct.convert")
+        path = os.path.join(output_dir, f"kokoro_decoder_har_ane_ln_{name}_{BUCKET_SECONDS}s.mlpackage")
+        ml.save(path)
+        print(f"✅ Saved {name}: {path}")
+        return path
+
+    print(f"[{time.ctime()}] Tracing + converting trunk...")
+    with torch.no_grad():
+        traced_trunk = torch.jit.trace(
+            trunk_wrapper, (zeros(x_pre_shape), zeros(ref_s_shape), zeros(har_shape)),
+            strict=False, check_trace=False,
+        )
+    trunk_path = _convert(
+        traced_trunk,
+        [
+            ct.TensorType(name="x_pre", shape=x_pre_shape, dtype=np.float32),
+            ct.TensorType(name="ref_s", shape=ref_s_shape, dtype=np.float32),
+            ct.TensorType(name="har", shape=har_shape, dtype=np.float32),
+        ],
+        [ct.TensorType(name="trunk")],
+        "trunk",
+    )
+
+    print(f"[{time.ctime()}] Tracing + converting body...")
+    with torch.no_grad():
+        traced_body = torch.jit.trace(
+            body_wrapper, (zeros(trunk_shape), zeros(ref_s_shape), zeros(har_shape)),
+            strict=False, check_trace=False,
+        )
+    body_path = _convert(
+        traced_body,
+        [
+            ct.TensorType(name="trunk", shape=trunk_shape, dtype=np.float32),
+            ct.TensorType(name="ref_s", shape=ref_s_shape, dtype=np.float32),
+            ct.TensorType(name="har", shape=har_shape, dtype=np.float32),
+        ],
+        [ct.TensorType(name="spec"), ct.TensorType(name="phase")],
+        "body",
+    )
+
+    print(
+        "   Next: uv run python scripts/verify_decoder_har_ane_split.py "
+        "(chained parity + per-stage census). A14 admittance is proven on the phone."
+    )
+    return trunk_path, body_path
