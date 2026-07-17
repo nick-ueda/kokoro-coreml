@@ -48,7 +48,16 @@ for b in "${BUCKETS[@]}"; do
   copy "kokoro_decoder_har_post_${b}s.mlpackage"
 done
 for t in "${PADDED[@]}"; do copy "kokoro_duration_t${t}.mlpackage"; done
-for t in "${EXACT[@]}"; do copy "kokoro_duration_exact_t${t}.mlpackage"; done
+# Exact-native-LSTM duration packages are produced by export_duration.py and
+# are NOT in the HF download set — optional, only the --exact-duration 1
+# bench path needs them.
+for t in "${EXACT[@]}"; do
+  if [ -d "$SRC/kokoro_duration_exact_t${t}.mlpackage" ]; then
+    copy "kokoro_duration_exact_t${t}.mlpackage"
+  else
+    echo "skipping optional kokoro_duration_exact_t${t}.mlpackage (not exported; --exact-duration 1 unavailable)"
+  fi
+done
 for t in "${F0N[@]}"; do copy "kokoro_f0ntrain_t${t}.mlpackage"; done
 
 if [ "$missing" -ne 0 ]; then

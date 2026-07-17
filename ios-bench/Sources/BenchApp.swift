@@ -28,12 +28,20 @@
 ///                           the padded unrolled ones (17k-134k ops); mirrors
 ///                           the Mac frontier rows' exact-duration path.
 ///
+/// Untethered runs: a home-screen launch has no launch arguments, so flags
+/// fall back to Documents/launch_args.txt (seeded by the first soak run,
+/// editable in the Files app — UIFileSharingEnabled). Soak mode also writes
+/// per-pass telemetry (RTF, thermal, battery, phys_footprint, lifecycle
+/// transitions) to Documents/soak-<timestamp>.csv, fsync'd per line, so a
+/// debugger-free run still leaves a full record.
+///
 /// Results are appended to Documents/<out> after every (arm, key) pair so a
 /// jetsam kill mid-run still leaves partial data. Per-stage timings come from
 /// ``SynthesisResult/timings`` (StageTimings in KokoroPipeline.swift), which
 /// the executor populates unconditionally on every call. Console lines
 /// prefixed "BENCH:" mirror progress; "BENCHDONE" marks completion.
 import SwiftUI
+import AVFoundation
 import CoreML
 import KokoroPipeline
 import KokoroSwift
@@ -84,6 +92,16 @@ struct StagePolicy {
         decoderPre: .cpuAndNeuralEngine, generator: .cpuAndGPU
     )
 
+    /// Everything on CPU+ANE, GPU excluded. Not on the ladder: this is the
+    /// background-synthesis viability probe (iOS bans Metal in the background
+    /// but permits ANE and CPU), selected explicitly via --policy. A failure
+    /// or a slow RTF here IS the data point — no fallback may mask it.
+    static let cpuAndNeuralEngine = StagePolicy(
+        name: "cpuAndNeuralEngine",
+        duration: .cpuAndNeuralEngine, f0n: .cpuAndNeuralEngine,
+        decoderPre: .cpuAndNeuralEngine, generator: .cpuAndNeuralEngine
+    )
+
     /// Ladder order: maximal `.all` first, then production-staged (the
     /// policy the published Mac Config F rows use), then no-ANE, then
     /// CPU-only as the last resort.
@@ -93,6 +111,26 @@ struct StagePolicy {
         StagePolicy(name: "cpuAndGPU", duration: .cpuAndGPU, f0n: .cpuAndGPU, decoderPre: .cpuAndGPU, generator: .cpuAndGPU),
         StagePolicy(name: "cpuOnly", duration: .cpuOnly, f0n: .cpuOnly, decoderPre: .cpuOnly, generator: .cpuOnly),
     ]
+
+    /// GPU-free like cpuAndNeuralEngine, but only decoder-pre — the one
+    /// stage whose ANE compile is proven to succeed on the test iPhones —
+    /// asks for the ANE. Everything else goes straight to CPU, skipping the
+    /// doomed ANE compile attempts that jetsammed a 4 GB iPhone 12 Pro
+    /// under all-stage cpuAndNeuralEngine (the padded duration models are
+    /// 17k-134k-op unrolled LSTMs — a documented compile-memory hazard, see
+    /// README/Guides/apple-silicon/Kokoro-A14-iPhone-generator-execution-guide.md).
+    static let backgroundSafe = StagePolicy(
+        name: "backgroundSafe",
+        duration: .cpuOnly, f0n: .cpuOnly,
+        decoderPre: .cpuAndNeuralEngine, generator: .cpuOnly
+    )
+
+    /// Policies addressable by --policy.
+    static let named: [String: StagePolicy] = {
+        var byName = [String: StagePolicy]()
+        for p in ladder + [cpuAndNeuralEngine, backgroundSafe] { byName[p.name] = p }
+        return byName
+    }()
 }
 
 // MARK: - Bundle-backed model provider
@@ -270,6 +308,97 @@ private func thermalStateName() -> String {
     }
 }
 
+/// App phys_footprint in MB — the number jetsam decisions are made on
+/// (matches Xcode's memory gauge, unlike resident_size). 0 on failure.
+private func physFootprintMB() -> Double {
+    var info = task_vm_info_data_t()
+    var count = mach_msg_type_number_t(
+        MemoryLayout<task_vm_info_data_t>.size / MemoryLayout<integer_t>.size
+    )
+    let kr = withUnsafeMutablePointer(to: &info) {
+        $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+            task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+        }
+    }
+    guard kr == KERN_SUCCESS else { return 0 }
+    return Double(info.phys_footprint) / 1_048_576
+}
+
+/// Battery percent (0–100; -1 if unavailable) and charge state. The state
+/// column is the confound check for untethered soaks: it must read
+/// "unplugged" for the run to say anything about real-world heat/battery.
+/// Requires UIDevice.isBatteryMonitoringEnabled (set in runSoak).
+@MainActor
+private func batterySnapshot() -> (pct: Double, state: String) {
+    let level = UIDevice.current.batteryLevel
+    let state: String
+    switch UIDevice.current.batteryState {
+    case .unplugged: state = "unplugged"
+    case .charging: state = "charging"
+    case .full: state = "full"
+    case .unknown: state = "unknown"
+    @unknown default: state = "unknown"
+    }
+    return (level >= 0 ? Double(level) * 100 : -1, state)
+}
+
+/// Appends soak telemetry to Documents/soak-<timestamp>.csv, one line per
+/// pass or lifecycle event, fsync'd per line so a crash/jetsam keeps the
+/// tail. This is the artifact an untethered run (no Xcode console) leaves
+/// behind; UIFileSharingEnabled makes it visible in the Files app mid-run.
+final class SoakCSVLogger: @unchecked Sendable {
+    let url: URL
+    private let handle: FileHandle
+    private let lock = NSLock()
+    private let start = Date()
+    private let iso = ISO8601DateFormatter()
+
+    init?() {
+        let df = DateFormatter()
+        df.dateFormat = "yyyyMMdd-HHmmss"
+        url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+            .appendingPathComponent("soak-\(df.string(from: Date())).csv")
+        FileManager.default.createFile(atPath: url.path, contents: nil)
+        guard let h = try? FileHandle(forWritingTo: url) else { return nil }
+        handle = h
+        write("time,elapsed_s,event,pass,wall_s,audio_s,x_realtime,app_state,thermal,buffered_s,battery_pct,battery_state,footprint_mb")
+    }
+
+    func pass(_ n: Int, wall: Double, audio: Double, appState: String,
+              buffered: Double, batteryPct: Double, batteryState: String) {
+        row(event: "pass", pass: "\(n)",
+            wall: String(format: "%.3f", wall),
+            audio: String(format: "%.2f", audio),
+            x: String(format: "%.2f", wall > 0 ? audio / wall : 0),
+            appState: appState,
+            buffered: String(format: "%.1f", buffered),
+            batteryPct: String(format: "%.1f", batteryPct),
+            batteryState: batteryState)
+    }
+
+    func event(_ label: String, appState: String = "",
+               batteryPct: Double? = nil, batteryState: String = "") {
+        row(event: label.replacingOccurrences(of: ",", with: ";"),
+            pass: "", wall: "", audio: "", x: "", appState: appState, buffered: "",
+            batteryPct: batteryPct.map { String(format: "%.1f", $0) } ?? "",
+            batteryState: batteryState)
+    }
+
+    private func row(event: String, pass: String, wall: String, audio: String,
+                     x: String, appState: String, buffered: String,
+                     batteryPct: String, batteryState: String) {
+        let elapsed = String(format: "%.1f", Date().timeIntervalSince(start))
+        write("\(iso.string(from: Date())),\(elapsed),\(event),\(pass),\(wall),\(audio),\(x),\(appState),\(thermalStateName()),\(buffered),\(batteryPct),\(batteryState),\(String(format: "%.1f", physFootprintMB()))")
+    }
+
+    private func write(_ line: String) {
+        lock.lock()
+        defer { lock.unlock() }
+        handle.write(Data((line + "\n").utf8))
+        try? handle.synchronize()
+    }
+}
+
 // MARK: - Runner
 
 @MainActor
@@ -282,16 +411,55 @@ final class BenchRunner: ObservableObject {
     /// Launch-argument access. Arms were split into separate processes after
     /// the iPhone 12 Pro (4 GB) jetsammed with both pipelines resident
     /// (signal 9 during the MLX 7s generation).
+    ///
+    /// Untethered fallback: a Springboard (home-screen) launch carries no
+    /// custom arguments, so when the process has none at all, flags are read
+    /// from Documents/launch_args.txt instead (whitespace-separated; written
+    /// once by the first soak run, editable in the Files app). All-or-nothing
+    /// on purpose: any Xcode-supplied argument disables the file entirely, so
+    /// a stale soak file can't hijack a tethered ladder/matrix run.
+    static let effectiveArgs: [String] = {
+        let procArgs = Array(ProcessInfo.processInfo.arguments.dropFirst())
+        if !procArgs.isEmpty { return procArgs }
+        guard let s = try? String(contentsOf: launchArgsFileURL, encoding: .utf8) else { return [] }
+        return s.split(whereSeparator: { $0.isWhitespace }).map(String.init)
+    }()
+
+    static let launchArgsFileURL = FileManager.default
+        .urls(for: .documentDirectory, in: .userDomainMask)[0]
+        .appendingPathComponent("launch_args.txt")
+
     static func argValue(_ flag: String) -> String? {
-        let args = ProcessInfo.processInfo.arguments
-        guard let i = args.firstIndex(of: flag), i + 1 < args.count else { return nil }
-        return args[i + 1]
+        guard let i = effectiveArgs.firstIndex(of: flag), i + 1 < effectiveArgs.count else { return nil }
+        return effectiveArgs[i + 1]
     }
     static let arms = (argValue("--arms") ?? "coreml,mlx").split(separator: ",").map(String.init)
     static let keys = (argValue("--keys") ?? "3s,7s,15s,30s").split(separator: ",").map(String.init)
     static let outName = argValue("--out") ?? "results.json"
     static let mode = argValue("--mode") ?? "ladder"
     static let exactDuration = (argValue("--exact-duration") ?? "0") == "1"
+    /// --policy <name>: pin the coreml arm to one StagePolicy (see
+    /// StagePolicy.named) with NO ladder fallback — a failure is the data
+    /// point. Soak mode defaults to cpuAndNeuralEngine.
+    static let policyOverride = argValue("--policy")
+    /// --soak-seconds N: how long soak mode keeps synthesizing (default 900).
+    static let soakSeconds = Double(argValue("--soak-seconds") ?? "900") ?? 900
+    /// Soak mode synthesizes one bucket per run (fresh models per bucket
+    /// would re-trigger AOT compiles mid-soak): the first explicit --keys
+    /// entry, else 15s (nearest bucket to FreeReader's chunk size).
+    static let soakKey = (argValue("--keys")?.split(separator: ",").first).map(String.init) ?? "15s"
+
+    /// Ladder-mode policies: the full fallback ladder, or just the pinned
+    /// policy when --policy is given.
+    static let activeLadder: [StagePolicy] = {
+        if let name = policyOverride {
+            guard let p = StagePolicy.named[name] else {
+                fatalError("--policy \(name) unknown; known: \(StagePolicy.named.keys.sorted().joined(separator: ","))")
+            }
+            return [p]
+        }
+        return StagePolicy.ladder
+    }()
 
     private var records: [[String: Any]] = []
 
@@ -340,6 +508,13 @@ final class BenchRunner: ObservableObject {
                 } catch {
                     await self.log("matrix run failed: \(error)")
                     await self.record(["arm": "coreml", "key": "matrix-level", "error": String(describing: error)])
+                }
+            } else if Self.mode == "soak" {
+                do {
+                    try await self.runSoak()
+                } catch {
+                    await self.log("soak run failed: \(error)")
+                    await self.record(["arm": "soak", "key": "mode-level", "error": String(describing: error)])
                 }
             } else if Self.mode == "g2p" {
                 do {
@@ -480,8 +655,9 @@ final class BenchRunner: ObservableObject {
         let weights = try loadHnsfWeights()
         // Cache persists across buckets while a policy works; a bucket that
         // fails restarts lower on the ladder with a fresh cache.
+        let ladder = Self.activeLadder
         var ladderIndex = 0
-        var cache = BundleModelCache(policy: StagePolicy.ladder[ladderIndex], useExactDuration: Self.exactDuration)
+        var cache = BundleModelCache(policy: ladder[ladderIndex], useExactDuration: Self.exactDuration)
 
         for key in Self.keys {
             let input = try await MainActor.run { try self.loadInput(key) }
@@ -489,7 +665,7 @@ final class BenchRunner: ObservableObject {
             var failure: String? = nil
 
             while series == nil {
-                let policy = StagePolicy.ladder[ladderIndex]
+                let policy = ladder[ladderIndex]
                 // First iteration triggers Core ML's on-device E5/ANE AOT
                 // specialization. On the Mac bakeoff the 30s bucket spent
                 // ~20 min here (README/Notes/external-bakeoff-phase2-run-log.md);
@@ -500,9 +676,9 @@ final class BenchRunner: ObservableObject {
                 } catch {
                     await log("coreml \(key) policy=\(policy.name) FAILED: \(error)")
                     await recordFailure(key: key, policyName: policy.name, cache: cache, error: error)
-                    if ladderIndex + 1 < StagePolicy.ladder.count {
+                    if ladderIndex + 1 < ladder.count {
                         ladderIndex += 1
-                        cache = BundleModelCache(policy: StagePolicy.ladder[ladderIndex], useExactDuration: Self.exactDuration)
+                        cache = BundleModelCache(policy: ladder[ladderIndex], useExactDuration: Self.exactDuration)
                     } else {
                         failure = String(describing: error)
                         break
@@ -512,12 +688,12 @@ final class BenchRunner: ObservableObject {
 
             let dur = input.canonical_duration_s ?? 0
             if let series {
-                await recordSuccess(key: key, policyName: StagePolicy.ladder[ladderIndex].name, series: series, canonicalDuration: dur)
+                await recordSuccess(key: key, policyName: ladder[ladderIndex].name, series: series, canonicalDuration: dur)
             } else {
                 await record([
                     "arm": "coreml",
                     "key": key,
-                    "compute_policy": StagePolicy.ladder[ladderIndex].name,
+                    "compute_policy": ladder[ladderIndex].name,
                     "canonical_duration_s": dur,
                     "error": failure ?? "unknown",
                 ] as [String: Any])
@@ -575,6 +751,123 @@ final class BenchRunner: ObservableObject {
                 }
             }
         }
+    }
+
+    // MARK: Soak mode (--mode soak)
+
+    /// Background-synthesis viability probe (the FreeReader spike's decisive
+    /// test): synthesize the same input in a loop for --soak-seconds, PLAYING
+    /// the audio through an AVAudioSession so the `audio` background mode
+    /// keeps the process alive when the screen locks. Without playback the
+    /// app would just be suspended on lock and the run would prove nothing
+    /// about the ANE. Synthesis is paced against the playhead (~20 s bounded
+    /// look-ahead), mirroring the shape of a real TTS reader, so passes keep
+    /// executing while backgrounded instead of racing ahead and going idle.
+    ///
+    /// Policy defaults to backgroundSafe (GPU excluded — a GPU pass in the
+    /// background aborts the process, which is the very thing being probed —
+    /// and ANE requested only where its compile is known to succeed). Every pass logs a "SOAK:" line: wall time, x-realtime
+    /// (audio/wall — higher is better, unlike the ladder records' rtf
+    /// field), app state, thermal state, buffered seconds. Lifecycle and
+    /// screen-lock transitions log as "SOAK: >>>" lines. Verdict: passes
+    /// with app=background and no crash for 2+ locked minutes.
+    nonisolated private func runSoak() async throws {
+        let policyName = Self.policyOverride ?? StagePolicy.backgroundSafe.name
+        guard let policy = StagePolicy.named[policyName] else {
+            fatalError("--policy \(policyName) unknown; known: \(StagePolicy.named.keys.sorted().joined(separator: ","))")
+        }
+        // 15s (the --keys default's nearest bucket to FreeReader's chunk
+        // size) unless --keys picks another bucket.
+        let key = Self.soakKey
+        let weights = try loadHnsfWeights()
+        let input = try await MainActor.run { try self.loadInput(key) }
+        let cache = BundleModelCache(policy: policy, useExactDuration: Self.exactDuration)
+        let player = SoakPlayer()
+        let csv = SoakCSVLogger()
+        Self.seedLaunchArgsFileIfMissing()
+        try await MainActor.run {
+            UIDevice.current.isBatteryMonitoringEnabled = true
+            SoakPlayer.logLifecycleTransitions { label in
+                let battery = batterySnapshot()
+                csv?.event(label, batteryPct: battery.pct, batteryState: battery.state)
+            }
+            try player.start()
+        }
+        if let csv {
+            csv.event("start policy=\(policyName) key=\(key) soak_seconds=\(Int(Self.soakSeconds))")
+            await log("soak CSV: \(csv.url.lastPathComponent) (Files app → KokoroIPhoneBench)")
+        } else {
+            await log("soak CSV logger FAILED to open — console/JSON only")
+        }
+
+        await log("soak \(key) policy=\(policyName) for \(Int(Self.soakSeconds))s — first pass includes ANE AOT compile (can take minutes); lock the screen once passes are flowing")
+        let start = Date()
+        var pass = 0
+        while Date().timeIntervalSince(start) < Self.soakSeconds {
+            let t0 = CFAbsoluteTimeGetCurrent()
+            let result = try synthesizeOnce(input, weights: weights, cache: cache)
+            let wall = CFAbsoluteTimeGetCurrent() - t0
+            pass += 1
+            let (appState, batteryPct, batteryState) = await MainActor.run {
+                () -> (String, Double, String) in
+                let state: String
+                switch UIApplication.shared.applicationState {
+                case .active: state = "active"
+                case .inactive: state = "inactive"
+                case .background: state = "background"
+                @unknown default: state = "unknown"
+                }
+                let battery = batterySnapshot()
+                return (state, battery.pct, battery.state)
+            }
+            await MainActor.run { player.schedule(result.audio) }
+            let buffered = await MainActor.run { player.bufferedAhead }
+            print("SOAK: pass \(pass) wall=\(String(format: "%.2f", wall))s audio=\(String(format: "%.1f", result.audioDurationSeconds))s x-realtime=\(String(format: "%.2f", wall > 0 ? result.audioDurationSeconds / wall : 0)) app=\(appState) thermal=\(thermalStateName()) buffered=\(String(format: "%.1f", buffered))s battery=\(String(format: "%.0f", batteryPct))%/\(batteryState) footprint=\(String(format: "%.0f", physFootprintMB()))MB")
+            csv?.pass(pass, wall: wall, audio: result.audioDurationSeconds,
+                      appState: appState, buffered: buffered,
+                      batteryPct: batteryPct, batteryState: batteryState)
+            await record([
+                "arm": "soak",
+                "key": key,
+                "compute_policy": policyName,
+                "pass": pass,
+                "wall_s": wall,
+                "audio_s": result.audioDurationSeconds,
+                "app_state": appState,
+                "thermal_state": thermalStateName(),
+                "buffered_s": buffered,
+                "battery_pct": batteryPct,
+                "battery_state": batteryState,
+                "footprint_mb": physFootprintMB(),
+                "elapsed_s": Date().timeIntervalSince(start),
+            ] as [String: Any])
+            // Bounded look-ahead: don't synthesize more than ~20 s past the
+            // playhead. Deadline-capped so a stalled player can't hang the run.
+            let waitStart = Date()
+            while await MainActor.run(body: { player.bufferedAhead }) > 20,
+                  Date().timeIntervalSince(waitStart) < 60,
+                  Date().timeIntervalSince(start) < Self.soakSeconds {
+                try await Task.sleep(nanoseconds: 500_000_000)
+            }
+        }
+        let finalBattery = await MainActor.run { batterySnapshot() }
+        csv?.event("done passes=\(pass)", batteryPct: finalBattery.pct,
+                   batteryState: finalBattery.state)
+        await log("soak complete: \(pass) passes in \(Int(Date().timeIntervalSince(start)))s — if the screen stayed locked 2+ min with app=background passes, background synthesis is VIABLE")
+    }
+
+    /// A Springboard launch carries no process arguments, so the first soak
+    /// run records its configuration to Documents/launch_args.txt; a later
+    /// home-screen launch (untethered soak — no debugger, no charging
+    /// confound) reads it back via `effectiveArgs` and repeats the same
+    /// soak. Never overwritten once present: edit or delete it in the Files
+    /// app to change untethered behavior.
+    nonisolated private static func seedLaunchArgsFileIfMissing() {
+        guard !FileManager.default.fileExists(atPath: launchArgsFileURL.path) else { return }
+        var line = "--mode soak --keys \(soakKey) --soak-seconds \(Int(soakSeconds)) --out \(outName)"
+        if let policy = policyOverride { line += " --policy \(policy)" }
+        if exactDuration { line += " --exact-duration 1" }
+        try? line.write(to: launchArgsFileURL, atomically: true, encoding: .utf8)
     }
 
     // MARK: G2P-only mode (--mode g2p)
@@ -673,6 +966,77 @@ final class BenchRunner: ObservableObject {
                 "rtf": audioSeconds > 0 && med > 0 ? med / audioSeconds : 0,
                 "error": failure ?? NSNull(),
             ] as [String: Any])
+        }
+    }
+}
+
+// MARK: - Soak playback
+
+/// Plays synthesized 24 kHz mono PCM through an AVAudioEngine. The active
+/// .playback session plus the UIBackgroundModes=audio entry in Info.plist is
+/// what keeps the process running (not suspended) while the screen is locked
+/// — the precondition for soak mode to probe background synthesis at all.
+final class SoakPlayer {
+    private let engine = AVAudioEngine()
+    private let player = AVAudioPlayerNode()
+    private let format = AVAudioFormat(
+        commonFormat: .pcmFormatFloat32, sampleRate: 24_000, channels: 1, interleaved: false
+    )!
+    private var scheduledSeconds: Double = 0
+
+    func start() throws {
+        let session = AVAudioSession.sharedInstance()
+        try session.setCategory(.playback, mode: .spokenAudio)
+        try session.setActive(true)
+        engine.attach(player)
+        engine.connect(player, to: engine.mainMixerNode, format: format)
+        try engine.start()
+        player.play()
+    }
+
+    func schedule(_ samples: [Float]) {
+        guard !samples.isEmpty, let buffer = AVAudioPCMBuffer(
+            pcmFormat: format, frameCapacity: AVAudioFrameCount(samples.count)
+        ) else { return }
+        buffer.frameLength = AVAudioFrameCount(samples.count)
+        samples.withUnsafeBufferPointer {
+            buffer.floatChannelData![0].update(from: $0.baseAddress!, count: samples.count)
+        }
+        player.scheduleBuffer(buffer)
+        scheduledSeconds += Double(samples.count) / format.sampleRate
+    }
+
+    /// Seconds of scheduled audio the playhead hasn't consumed yet.
+    var bufferedAhead: Double {
+        guard let nodeTime = player.lastRenderTime,
+              let playerTime = player.playerTime(forNodeTime: nodeTime) else {
+            return 0
+        }
+        return scheduledSeconds - Double(playerTime.sampleTime) / playerTime.sampleRate
+    }
+
+    /// Log app-lifecycle and screen-lock transitions so the SOAK pass lines
+    /// can be read against when the lock actually happened.
+    /// protectedDataWillBecomeUnavailable ≈ screen locked (passcode devices).
+    /// `onEvent` additionally receives each label on the main actor — soak
+    /// mode uses it to land the transitions in the CSV, where they are the
+    /// only lock/unlock record an untethered run has.
+    static func logLifecycleTransitions(onEvent: (@MainActor (String) -> Void)? = nil) {
+        let transitions: [(Notification.Name, String)] = [
+            (UIApplication.willResignActiveNotification, "willResignActive"),
+            (UIApplication.didEnterBackgroundNotification, "didEnterBackground (Metal now banned)"),
+            (UIApplication.willEnterForegroundNotification, "willEnterForeground"),
+            (UIApplication.didBecomeActiveNotification, "didBecomeActive"),
+            (UIApplication.protectedDataWillBecomeUnavailableNotification, "screen LOCKED"),
+            (UIApplication.protectedDataDidBecomeAvailableNotification, "screen UNLOCKED"),
+        ]
+        for (name, label) in transitions {
+            NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) { _ in
+                print("SOAK: >>> \(label)")
+                if let onEvent {
+                    Task { @MainActor in onEvent(label) }
+                }
+            }
         }
     }
 }
