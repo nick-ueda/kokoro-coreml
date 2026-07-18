@@ -491,6 +491,29 @@ SNR/boundary numbers + WAVs + a `README/Notes/` verdict; the ear-check
     regardless: an A14 device-audio ear-check (finite ≠ good) and a hard power
     number (tethered powermetrics / longer soak vs the coarse "~half baseline").
 
+- 2026-07-18 **T8 RUN — naive windowing fails the SNR gate; a real AdaIN-context
+  effect, ear-check owed.** Probe `scripts/probe_windowed_vocode.py`; full writeup
+  `README/Notes/ane-generator-windowing-experiment-2026-07-18.md`. Windowed 3 s
+  vocoding of a global 12.5 s prosody plan is **2.11 dB** SNR vs a full-length
+  reference (which is itself a valid 32.70 dB vs the shipped graph). Confirmed
+  REAL, not a bug: cross-correlation peaks at lag 0 (corr ~0.75), uniform across
+  every window interior, per-window energy preserved (RMS ratios 0.93–1.32), and
+  SNR climbs monotonically with window size (3 s → 2.1, 5 s → 2.8, 6.25 s → 5.2
+  dB). Mechanism: every `AdaIN1d` normalizes over the time axis, so a 3 s window's
+  per-channel stats differ from the global stats and perturb the vocoder texture
+  uniformly (the ln-lowered generator has the identical issue). The obvious fix
+  (feed global stats) needs a full-generator forward to compute them — the very
+  thing the 3 s ANE cap forbids — so it's a 2-pass + model change, not free.
+  **Honest read:** the "plan globally, vocode in windows" idea holds for PROSODY
+  (F0/durations are global, in the shared plan) but NOT the vocoder's fine
+  texture. The global reference is undeployable anyway (16,384 limit), and the
+  deployed 3 s bucket already does per-3 s AdaIN — so the operative question is
+  absolute quality + seam continuity by EAR, which is owner-run (no
+  `GEMINI_API_KEY`, as in T2). WAVs at
+  `Scratchpad/windowed_vocode_{windowed,reference,original}.wav`. If audible:
+  crossfade seams (cheap), else extend the ANE bucket (FluidAudio-style) or the
+  GPU-foreground handoff.
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give

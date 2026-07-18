@@ -5,8 +5,87 @@ Collected: 2026-07-18. Task **T8** of
 supersedes the loosely-scoped "AdaIN windowed-stats experiment" in that plan's
 Tasks list, using the geometry we now know is actually ANE-deployable.
 
-**Status: DESIGNED, NOT YET RUN.** This note is the spec; a follow-on session
-builds `scripts/probe_windowed_vocode.py` and fills in the numbers + verdict.
+**Status: RUN 2026-07-18 — see Results below.** Probe:
+`scripts/probe_windowed_vocode.py`. Headline: naive per-window vocoding fails the
+SNR gate (2.1 dB vs a global-AdaIN reference), and it's a REAL effect (the
+vocoder's AdaIN normalization needs near-global context), not a bug. Whether it's
+audible is owner-run (no `GEMINI_API_KEY` here, same as T2); WAVs written.
+
+## Results (2026-07-18)
+
+Real ~14.5 s utterance (510 tokens, ALBERT's cap — the frontend itself maxes at
+~15 s, so long text must be frontend-chunked at ≤510 tokens regardless; this
+tests the finer 3 s generator windowing within one such plan). Geometry: 1,000
+ASR frames → 12.5 s vocoded, 5 windows.
+
+| comparison | SNR | note |
+| --- | ---: | --- |
+| **windowed vs full-length reference** | **2.11 dB** | HEADLINE — the windowing effect |
+| pre-trim reference vs shipped | 32.70 dB | the reference is VALID (T2's ~28 dB, better at 15 s) |
+| worst boundary seam (±0.1 s) | −4.0 dB | per-seam [2.6, 0.7, 5.8, −4.0] |
+
+**It is a real effect, not a bug** — four checks:
+
+- **Aligned:** per-window cross-correlation peaks at lag 0 (no slicing offset),
+  but only corr ≈ 0.75 even at the peak → genuinely decorrelated fine structure.
+- **Uniform:** every window's *interior* core SNR is ~1–3 dB (not just the seams),
+  so it isn't a boundary/halo artifact — the whole window is affected.
+- **Energy preserved:** per-window RMS ratios 0.93–1.32 (no blow-up); the
+  difference is phase/texture, not level.
+- **Monotonic in window size:** SNR climbs as the window grows toward the full
+  utterance — 3 s → **2.1 dB**, 5 s → **2.8 dB**, 6.25 s → **5.2 dB** — the
+  signature of the AdaIN *normalization window*, and only reaching global quality
+  as the window → the whole utterance.
+
+**Mechanism.** Every `AdaIN1d` normalizes its features over the *time axis*
+(per-channel mean/var reduced over ALL frames). A 3 s window computes those stats
+over its own 3 s; the full-length reference over the whole 12.5 s. The stats
+differ, so each window's vocoder fine structure is perturbed uniformly (energy
+preserved, texture decorrelated). Across 48 AdaIN layers this compounds to corr
+0.75 / 2 dB. The layer_norm-lowered generator (T6) has the identical problem —
+`F.layer_norm` over time is the same per-window normalization.
+
+**Why the obvious fix doesn't cleanly deploy.** Feeding each window the GLOBAL
+per-channel AdaIN stats would recover the reference (they're position-independent
+scalars). But computing them requires an AdaIN-layer forward over the *whole*
+utterance — i.e. running the full generator, the very thing the 3 s ANE cap
+forbids. So "global stats" is a 2-pass + model-change path, not a free fix.
+
+## What this means (honest read)
+
+- **You cannot window the vocoder and reproduce a single global synthesis.** The
+  "plan globally, vocode in 3 s windows" idea works for *prosody* (F0/durations
+  ARE global here — they live in the shared plan, not in AdaIN) but NOT for the
+  vocoder's fine texture, which AdaIN ties to near-global context.
+- **BUT the global reference is a fiction for deployment** (a 15 s vocode can't
+  run on the A14 ANE — the 16,384 limit is the whole reason we window). The
+  deployed 3 s bucket *already* normalizes AdaIN over 3 s. So the operative
+  question is NOT "does windowed match a global vocode" (it can't) but "does
+  per-3 s-window vocoding, with global prosody, **sound good** — natural, and
+  continuous across the 2.5 s seams?" The per-window RMS spread (up to 1.32×)
+  flags possible level "pumping" at seams as the concrete thing to listen for.
+- **SNR is the wrong final judge** (T2's lesson: run-to-run is 20 dB and sounds
+  identical). 2 dB is below that floor, so it's *likely* audible — but the
+  prosody is preserved and only texture differs, so it may still be acceptable.
+  **The ear decides.** WAVs: `Scratchpad/windowed_vocode_{windowed,reference,original}.wav`.
+
+## Next (in priority order)
+
+1. **Owner ear-check** (deciding gate): A/B `windowed` vs `reference`, and listen
+   to `windowed` alone for seam pumping / naturalness. This is owner-run (no
+   `GEMINI_API_KEY` on this Mac).
+2. If audible seams only → **output crossfade** at the halos (smooths level jumps;
+   won't fix per-window texture) — cheap, try first.
+3. If the per-window texture itself is audible → the vocoder needs near-global
+   context, so window-of-the-vocoder is out; fall back to **extending the ANE
+   bucket** (FluidAudio-style multi-graph split, ~25–30 s — see
+   [background-tts-direction-2026-07-18.md](background-tts-direction-2026-07-18.md))
+   or the **GPU-foreground / pre-buffer** handoff. The global-AdaIN-stats route is
+   a last resort (2-pass + model change).
+
+---
+
+## Original design spec (below) — as executed
 
 ## The question this answers (and why it decides the product)
 
