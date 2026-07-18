@@ -1,6 +1,6 @@
 ---
 title: Canonical Source Coverage
-last_synced: 2026-07-17
+last_synced: 2026-07-18
 coverage_index: true
 ---
 
@@ -59,8 +59,10 @@ This is a deterministic coverage index, not a current-belief page. It lists read
 - [README/Notes/ane-generator-coreml-export-2026-07-17.md](../Notes/ane-generator-coreml-export-2026-07-17.md)
 - [README/Notes/ane-generator-layernorm-shrink-2026-07-17.md](../Notes/ane-generator-layernorm-shrink-2026-07-17.md)
 - [README/Notes/ane-generator-split-executor-2026-07-17.md](../Notes/ane-generator-split-executor-2026-07-17.md)
+- [README/Notes/ane-generator-windowing-experiment-2026-07-18.md](../Notes/ane-generator-windowing-experiment-2026-07-18.md)
 - [README/Notes/ane-pretrim-equivalence-2026-07-17.md](../Notes/ane-pretrim-equivalence-2026-07-17.md)
 - [README/Notes/apple-silicon-nvme-energy-measurement-create-guide-brief.md](../Notes/apple-silicon-nvme-energy-measurement-create-guide-brief.md)
+- [README/Notes/background-tts-direction-2026-07-18.md](../Notes/background-tts-direction-2026-07-18.md)
 - [README/Notes/bakeoff-results-v1.md](../Notes/bakeoff-results-v1.md)
 - [README/Notes/bakeoff-results-v2.md](../Notes/bakeoff-results-v2.md)
 - [README/Notes/bakeoff-results.md](../Notes/bakeoff-results.md)

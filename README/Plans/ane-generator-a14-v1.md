@@ -181,6 +181,29 @@ each side (discard halos, hard-concat), AdaIN stats computed per-window.
 Write both WAVs + SNR for owner ABX. Do not build any Core ML export for
 this.
 
+### T8 — Windowed vocoding of a global prosody plan [Opus or Sonnet — the pivot for background long-form]
+
+Refines and supersedes the loosely-scoped "AdaIN windowed-stats experiment"
+(T6, above) with the geometry we now know is ANE-deployable. **Full design
+spec:** `README/Notes/ane-generator-windowing-experiment-2026-07-18.md` — read
+it in full before starting. In one line: pure-PyTorch fp32 probe
+(`scripts/probe_windowed_vocode.py`) that builds ONE long (~15 s) real
+utterance's global prosody plan, vocodes it (a) full-length single-pass
+(reference) vs (b) in 3 s windows — **240-frame window / 200-frame (2.5 s)
+stride / 20-frame (0.25 s) halos INSIDE the 3 s budget**, per-window AdaIN,
+discard halos, hard-concat — then reports SNR + boundary-seam SNR + writes both
+WAVs (plus the shipped model as an ear anchor) for the owner ABX. One shared
+`har` draw; no Core ML export.
+
+Why it matters: it decides whether the background-safe 3 s ANE generator can
+deliver **sentence-level prosody** by planning globally (duration/F0Ntrain/
+decoder-pre are NOT 3 s-limited) and vocoding in windows. Pass → the background
+long-form story is solved with the generator we already have; fail → extend the
+ANE bucket (FluidAudio-style split) or use the GPU-foreground/pre-buffer handoff
+(see `README/Notes/background-tts-direction-2026-07-18.md`). Acceptance: script +
+SNR/boundary numbers + WAVs + a `README/Notes/` verdict; the ear-check
+(indistinguishable/audible) is the deciding gate and is owner-run.
+
 ## Owner-run device steps (not for coding agents)
 
 - T0a: `--mode matrix --keys 3s,30s` on the 12 Pro — the `generator=ne` cell
@@ -441,6 +464,32 @@ this.
     receipt. (Benign, pre-existing, NOT from T7: the
     `unsafeForcedSync ... Swift Concurrent context` warning is the bench
     harness's existing nonisolated predict path.)
+
+- 2026-07-18 **DIRECTION SET — background long-form + FluidAudio eval + T8
+  designed** (no code; strategy + docs). After T7's soak proved the split runs
+  finite on the A14, the question turned to shipping long-form reading. Full
+  strategic memory: `README/Notes/background-tts-direction-2026-07-18.md`. Key
+  calls:
+  - **Plan prosody globally, vocode in 3 s windows.** The 3 s ANE cap is ONLY the
+    generator; duration/F0Ntrain/decoder-pre plan prosody over the whole sentence
+    with no axis limit. So "15–30 s buckets for prosody" = a sentence-length
+    *planning* span (free on the background-safe path) + windowed 3 s *vocoding*.
+    Whether per-window AdaIN is audible is the one unknown → **T8**.
+  - **FluidAudio (`FluidInference/FluidAudio`, KokoroAne) evaluated.** Same
+    architecture (multi-graph split, generator on ANE, iSTFT off-ANE) — strong
+    independent validation — but NOT a drop-in: its iSTFT tail runs on the **GPU**
+    (banned in the iOS background; its GPU-free presets crash in libBNNS), and it
+    has **zero A14 validation** (Mac-only benchmarks; already hits admit-then-crash
+    on the newer M5). Their weakness (GPU iSTFT) is exactly our host-Swift iSTFT
+    strength. They ARE ahead on input length (~25–30 s/pass via frame caps) — the
+    technique to borrow if T8 fails.
+  - **Contingent GPU-foreground / ANE-background handoff** designed (only if T8
+    fails); prefer "ANE-3 s everywhere" if T8 passes (simpler is better).
+  - **T8 (windowed vocoding) designed and added to Tasks** — the pivot that
+    decides the whole background-reading direction. Spec:
+    `README/Notes/ane-generator-windowing-experiment-2026-07-18.md`. Still owed
+    regardless: an A14 device-audio ear-check (finite ≠ good) and a hard power
+    number (tethered powermetrics / longer soak vs the coarse "~half baseline").
 
 ## Execution protocol
 
