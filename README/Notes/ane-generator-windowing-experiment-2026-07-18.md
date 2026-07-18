@@ -5,11 +5,13 @@ Collected: 2026-07-18. Task **T8** of
 supersedes the loosely-scoped "AdaIN windowed-stats experiment" in that plan's
 Tasks list, using the geometry we now know is actually ANE-deployable.
 
-**Status: RUN 2026-07-18 — see Results below.** Probe:
-`scripts/probe_windowed_vocode.py`. Headline: naive per-window vocoding fails the
-SNR gate (2.1 dB vs a global-AdaIN reference), and it's a REAL effect (the
-vocoder's AdaIN normalization needs near-global context), not a bug. Whether it's
-audible is owner-run (no `GEMINI_API_KEY` here, same as T2); WAVs written.
+**Status: RUN + EAR-CHECK PASSED 2026-07-18 — GREEN-LIT.** Probe:
+`scripts/probe_windowed_vocode.py`. Headline: naive per-window vocoding is 2.1 dB
+SNR vs a full-length reference — a REAL AdaIN-context effect, not a bug — BUT that
+reference is an *undeployable* global vocode (12.5 s body > the 16,384 limit), and
+the owner ear-check (the actual gate) found **`windowed` indistinguishable from the
+shipped model**. So windowed 3 s vocoding of a global prosody plan is
+**perceptually transparent → green-lit**. See Results + Verdict below.
 
 ## Results (2026-07-18)
 
@@ -69,19 +71,37 @@ forbids. So "global stats" is a 2-pass + model-change path, not a free fix.
   prosody is preserved and only texture differs, so it may still be acceptable.
   **The ear decides.** WAVs: `Scratchpad/windowed_vocode_{windowed,reference,original}.wav`.
 
-## Next (in priority order)
+## Verdict — PASSED (owner ear-check, 2026-07-18)
 
-1. **Owner ear-check** (deciding gate): A/B `windowed` vs `reference`, and listen
-   to `windowed` alone for seam pumping / naturalness. This is owner-run (no
-   `GEMINI_API_KEY` on this Mac).
-2. If audible seams only → **output crossfade** at the halos (smooths level jumps;
-   won't fix per-window texture) — cheap, try first.
-3. If the per-window texture itself is audible → the vocoder needs near-global
-   context, so window-of-the-vocoder is out; fall back to **extending the ANE
-   bucket** (FluidAudio-style multi-graph split, ~25–30 s — see
-   [background-tts-direction-2026-07-18.md](background-tts-direction-2026-07-18.md))
-   or the **GPU-foreground / pre-buffer** handoff. The global-AdaIN-stats route is
-   a last resort (2-pass + model change).
+The owner A/B'd `windowed` vs `original` (the shipped full-length model — a
+*stricter* anchor than the `windowed` vs `reference` the acceptance asked for) and
+**could not tell them apart.** So the 2.11 dB SNR was measuring against an
+undeployable global vocode; the ear confirms the per-window AdaIN texture shift is
+inaudible, and the indistinguishable A/B also subsumes the seam check (a pumping
+−4.0 dB seam at ~10 s would have been audible). **Windowed 3 s vocoding of a global
+prosody plan is perceptually transparent — the "plan globally, vocode in windows"
+architecture is confirmed with the current split generator** (no bigger bucket, no
+FluidAudio extension, no GPU handoff).
+
+**Caveat:** this listen was fp32 on the Mac. It closes the *windowing-algorithm*
+question, NOT fp16-on-A14 rendering — the on-device listen (owed regardless) covers
+both at once and is folded into the T10 device gate below.
+
+## Next (green-lit path → Plan T9–T12)
+
+1. **T9** — wire plan-globally / vocode-in-3 s-windows into the Swift executor,
+   Mac-verified against this probe's `wav_W`.
+2. **T10** — long-form device bench + retrievable WAV so the owner hears real
+   fp16 A14 output (the on-device counterpart to this fp32 listen) and reads RTF.
+3. **T11** — the hard power number (soak / `powermetrics --samplers ane`) — the
+   spike's actual goal, still owed.
+4. **T12** — production wiring behind the runtime `KokoroModelProvider`.
+
+Only if the on-device fp16 audio surprises us: crossfade the seams (cheap; the
+−4.0 dB seam at ~10 s is the candidate) → else extend the ANE bucket (FluidAudio-
+style; the monotonic 3 s→2.1 / 5 s→2.8 / 6.25 s→5.2 dB sweep quantifies the payoff)
+or the GPU-foreground / pre-buffer handoff → global-AdaIN stats is the last resort
+(2-pass + model change).
 
 ---
 

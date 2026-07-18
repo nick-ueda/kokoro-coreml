@@ -204,6 +204,93 @@ ANE bucket (FluidAudio-style split) or use the GPU-foreground/pre-buffer handoff
 SNR/boundary numbers + WAVs + a `README/Notes/` verdict; the ear-check
 (indistinguishable/audible) is the deciding gate and is owner-run.
 
+**T8 outcome (2026-07-18): PASSED** — the owner ear-check found `windowed`
+indistinguishable from the shipped model, so the tasks below productionize the
+green-lit "plan globally, vocode in 3 s windows" design. Do them in order (each
+unblocks the next); the on-device gates between them are owner-run.
+
+### T9 — Windowed-vocode executor: plan globally, vocode in 3 s windows [Opus or Sonnet]
+
+The pivot T8 unblocked. Stages 1–7 (duration, F0Ntrain, decoder-pre) run over the
+WHOLE frontend chunk (≤510 tokens / ~15 s — the ALBERT cap; long text is
+frontend-chunked at sentence boundaries regardless, exactly as
+`_long_vocoder_inputs` in the probe does); only stage 8/9 (the T7 split ANE
+generator + host iSTFT) is 3 s-capped and must loop.
+
+**`scripts/probe_windowed_vocode.py` is the validated ground truth — port its
+geometry, do NOT re-derive.** window = 240 ASR frames (3 s package: 14,401 body /
+72,000 samples); halo = 20 each side; core/stride = 200; `1 ASR frame = 300 samples
+= 60 body frames`. Window k: `lo = max(0, k·200 − 20)`, `hi = min(asr_len, k·200 +
+220)`; x_pre `[:, :, lo:hi]`; har `[:, :, 60·lo : 60·hi + 1]`; run split gen + host
+iSTFT; keep samples `[300·(k·200 − lo) : 300·(k·200 + 200 − lo)]`; hard-concat; trim
+to `300·asr_len`.
+
+Implement behind the T7 `predictGeneratorSplit` seam in
+`swift/Sources/KokoroPipeline/`: a windowed driver owning the loop + slicing +
+concat in ONE place; `executeKokoroSynthesis` calls it when the utterance exceeds
+one 3 s window. Bench: a policy/flag that runs stages 1–7 whole-chunk then the
+windowed generator loop.
+
+**Two things to settle before coding (STOP-and-report if blocked, don't thrash):**
+(1) confirm a decoder-pre package at the chunk length runs pinned CPU+ANE (the
+direction note claims 15 s/30 s packages exist); if only 7 s exists, report — do not
+silently re-bucket the planner. (2) The ANE package is FIXED-shape 240 frames, but
+the first/last windows are shorter. Prefer **overlapping edge windows to a full
+240-frame span** (keep only the needed core) over zero-padding — zero-pad pollutes
+the AdaIN time-statistics that T8 just validated. Re-verify parity against a probe
+variant matching whichever edge policy you pick.
+
+Acceptance: a Swift golden test asserts the executor's waveform matches the probe's
+`wav_W` on identical fixture inputs (fp32, max-abs < 1e-4, mirroring T3) — add
+`scripts/dump_windowed_vocode_golden.py` to dump x_pre/ref_s/har/`wav_W`. `swift
+test` green, `xcodebuild … build` succeeds. Device execution is owner-run.
+Traps: one shared full-length `har`, sliced per window (never regenerate);
+per-window AdaIN over the 240-frame span IS the validated deployable behavior — do
+NOT inject global stats.
+
+### T10 — Long-form device bench + retrievable WAV capture [Sonnet]
+
+Gives the owner the on-device fp16 ear-check (T8's Mac listen was fp32) and the
+long-form RTF. Extend `ios-bench/`: a `--text <string>` (or bundled long-form
+fixture) drives T9's windowed executor over a real ~15 s utterance under
+`--policy aneGeneratorSplit`; persist the output as a 24 kHz mono WAV in the app's
+Documents container and log its path (reuse any existing audio-persist path; else a
+minimal writer mirroring `P._write_wav`); extend the T7 `ANEGEN: … finite-fraction`
+log to report per-window finite-fraction across the whole run plus total wall / RTF.
+
+Acceptance: `xcodebuild … build` succeeds, `swift test` green. Owner then runs on
+the A14, pulls the WAV (devicectl / Finder container), listens (fp16 quality + seam
+continuity), and reads off long-form RTF + finite-fraction. This is the device gate
+that closes the fp16-rendering question the T8 note flagged.
+
+### T11 — Hard power number under windowed long-form [owner-run; minimal coding]
+
+The spike's ACTUAL goal, still owed — replace the coarse "~half baseline"
+(5 %-granularity battery) with a real draw. Owner-run: an untethered soak
+(`SPIKE_RUNBOOK.md` Test 3b) driving T10's long-form windowed path under
+`--policy aneGeneratorSplit` long enough for ≥2 clean 5 % ticks, OR tethered
+`powermetrics --samplers ane` for a direct ANE-power receipt; convert %/h→W with the
+aged-pack invariant (76 % health → ~8.2 Wh). Coding only if needed [Sonnet]: a
+hands-free "loop long-form synthesis" soak driver so the owner isn't tapping between
+utterances (skip if Test 3b already covers it). Acceptance: a `README/Notes/` note
+with W (or %/h + the Wh conversion), thermal trajectory, and sustained-load RTF vs
+the CPU-generator baseline's ~2.5–3.5 W.
+
+### T12 — Production wiring: runtime KokoroPipeline vends the windowed split [Opus]
+
+Everything above lives behind the BENCH provider; the runtime `KokoroPipeline` still
+inherits the `nil` `generatorSplitModels` default (deliberate since T7). Wire the
+runtime path: `KokoroModelProvider` (runtime, not bench) vends the split trunk/body
+packages and selects the windowed executor for background synthesis; **warmup
+strategy** — pre-warm the ANE models at launch (cold ANE compile was 4.9 s cool but
+**411 s** on a thermally-pressured phone; warm on the lifecycle transitions the soak
+already logs); keep the foreground `.cpuAndGPU` full-bucket path resident for the
+contingent GPU-foreground/pre-buffer handoff (wire the switch, but prefer
+ANE-3 s-everywhere now T8 passed). Acceptance (fork-side): `swift test` green; the
+runtime pipeline produces windowed long-form audio under a background-simulating
+harness. NOTE: the FreeReader app integration (consuming the updated package) is a
+SEPARATE owner step in `~/Git/FreeReader` — agents do NOT touch that repo.
+
 ## Owner-run device steps (not for coding agents)
 
 - T0a: `--mode matrix --keys 3s,30s` on the 12 Pro — the `generator=ne` cell
@@ -513,6 +600,22 @@ SNR/boundary numbers + WAVs + a `README/Notes/` verdict; the ear-check
   `Scratchpad/windowed_vocode_{windowed,reference,original}.wav`. If audible:
   crossfade seams (cheap), else extend the ANE bucket (FluidAudio-style) or the
   GPU-foreground handoff.
+
+- 2026-07-18 **T8 EAR-CHECK PASSED (owner) — windowing GREEN-LIT.** The owner A/B'd
+  `windowed` vs `original` (the shipped full-length model — a stricter anchor than
+  the windowed-vs-reference the acceptance required) and could not distinguish them.
+  So the 2.11 dB SNR measured against an undeployable global vocode; the ear
+  confirms the per-window AdaIN texture shift is inaudible (and subsumes the seam
+  check — a pumping −4.0 dB seam would have been audible). **"Plan prosody globally,
+  vocode in 3 s windows" is confirmed with the current T7 split generator** — no
+  bigger bucket, no FluidAudio extension, no GPU handoff. Caveat: the fp32-on-Mac
+  listen closes the windowing-ALGORITHM question, not fp16-on-A14 rendering (folded
+  into T10's device gate). Full verdict:
+  `README/Notes/ane-generator-windowing-experiment-2026-07-18.md` §Verdict. **Queued
+  the productionization ladder T9–T12** (Tasks section): T9 windowed executor → T10
+  long-form device bench + WAV capture → T11 the hard power number → T12 runtime
+  `KokoroModelProvider` wiring. T9 is the next coding task; T10/T11 gate on owner
+  device runs.
 
 ## Execution protocol
 
