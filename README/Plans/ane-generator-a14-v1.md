@@ -765,6 +765,30 @@ SEPARATE owner step in `~/Git/FreeReader` — agents do NOT touch that repo.
     (warmup-iter 0 wall vs the 8.38 s warm median). **Next: T11 (power) then T12
     (production wiring + pre-warm).**
 
+- 2026-07-19 **T11 PROTOCOL WRITTEN — no code added, soak not yet run.** Full
+  writeup: `README/Notes/ane-generator-power-soak-protocol-2026-07-19.md`. Key
+  finding: **`SPIKE_RUNBOOK.md` Test 3b's existing `--mode soak` needed zero new
+  code.** It already loops the identical `synthesizeOnce`/`executeKokoroSynthesis`
+  call every other mode uses, already accepts an arbitrary `--policy` and `--keys`,
+  and already logs battery %/thermal/footprint/x-realtime to a per-line-fsync'd CSV
+  untethered — so `--mode soak --keys 15s --policy aneGeneratorSplit` exercises T9's
+  windowed executor on every pass for the same reason T10's ladder run did (the
+  provider's 3 s-only split guard is the switch), and `--policy backgroundSafe`
+  reproduces the CPU baseline the plan's "Why" section's ~2.5–3.5 W figure came from.
+  The note gives the owner: exact commands for both arms (`--soak-seconds 3600`
+  default), the step-by-step protocol (tethered priming → clear
+  `launch_args.txt` between arms, a real gotcha since
+  `seedLaunchArgsFileIfMissing` never overwrites an existing file → cool to ambient →
+  untethered leg at matched 35–70 % SoC → screen-locked for the duration), the
+  hygiene checklist (unplugged throughout, warm-first exclusion of the cold-compile
+  transient, no `powermetrics` on the phone — it's macOS-only and cannot measure the
+  iPhone), the `%/h × 0.082 = W` conversion (76 % health → ~8.2 Wh, cross-checked
+  against the plan's own 31–43 %/h → 2.5–3.5 W numbers), an optional tethered
+  Instruments Energy/Neural-Engine cross-check, and a results skeleton table for the
+  owner to fill. **The soak itself and the resulting Watts number remain owed** —
+  this task's deliverable was making it runnable and documenting the protocol, not
+  running it. T12 should not be started until the owner fills in the skeleton.
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give
