@@ -709,6 +709,37 @@ SEPARATE owner step in `~/Git/FreeReader` — agents do NOT touch that repo.
   behavior-identical), `xcodebuild ... build` **SUCCEEDED**. T10's device path is now
   clear of this launch-time throw.
 
+- 2026-07-18 **T10 COMPLETE** — long-form device bench + WAV capture wired, no
+  device run performed (owner-run per protocol). Full writeup:
+  `README/Notes/ane-generator-longform-device-bench-2026-07-18.md`. Key finding:
+  **no new bench flag or fixture was needed.** `ios-bench/Resources/bench_inputs/
+  15s.json` is already a real ~14 s utterance (219 tokens, `canonical_duration_s:
+  13.9`), and `--policy aneGeneratorSplit` already routes any bucket > 3 s through
+  T9's windowed executor (the provider's 3 s-only split guard IS the switch, per
+  T9's inheritance note) — so `--arms coreml --keys 15s --policy aneGeneratorSplit`
+  is the whole owner command. Confirmed before coding: `kokoro_decoder_pre_15s` and
+  `kokoro_f0ntrain_t600` (the 15 s bucket's OWN `tFramesForBucket` entry — a
+  different axis than the windowing `fullF0Len`, which is `15*24000/300 = 1200`,
+  dividing evenly into 6 windows) are both staged, so the windowed path is
+  guaranteed to trigger. Changes confined to `ios-bench/Sources/BenchApp.swift`
+  (no `WindowedGeneratorExecutor.swift`/`KokoroSynthesisExecutor.swift` edits
+  needed — T9 already computes and logs everything, just per-call, not per-run):
+  `WarmSeries` gained `aneFiniteFractions`/`lastAudio`; a new
+  `writeWavMono16NoPeakNormalize` (NOT a reuse of the Mac `kokoro-bench` CLI's
+  peak-normalizing writer — that would hide real level from the ear-check) writes
+  `Documents/audio-<key>-<policy>.wav`; a new `persistWavAndLogSummary`, called
+  from ladder mode only, writes the WAV and logs/records an "ANEGEN SUMMARY:" line
+  (min/mean finite-fraction, total wall, RTF) aggregated over every timed
+  iteration; `recordSuccess` folds the same fields into the results JSON. Additive
+  only: the `--keys 3s` micro-bench (T7 path) is unaffected beyond also gaining a
+  harmless WAV write. `swift test` **62/62** (unchanged), `xcodebuild ... build`
+  **SUCCEEDED** (only pre-existing Swift 6-mode warnings, none new). Exact owner
+  device-run command, WAV-retrieval steps (Finder file-sharing / Xcode container
+  download / AirDrop — all work off the existing `UIFileSharingEnabled`), and the
+  fp32-vs-fp16 ear-check control WAVs to A/B against are in the note. T11 (the hard
+  power number) and T12 (runtime wiring) are next; both still gate on this owner
+  device run.
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give
