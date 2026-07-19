@@ -390,167 +390,232 @@ public func executeKokoroSynthesis(
     }
     try tensorDump?.writeFloatArray(name: "har", values: harFlat, shape: [1, 22, harFrames])
 
-    // Stage 8: GeneratorFromHar Core ML.
+    // Stage 8/9: GeneratorFromHar Core ML (+ host iSTFT for ANE packages).
     //
-    // Two shapes of generator flow through here, both entirely behind this
-    // stage boundary (decoder-pre, F0, the host iSTFT, and the SynthesisResult
-    // shape are untouched by the choice — README/Plans/ane-generator-a14-v1.md
-    // T7):
-    //   - single: one package, one predict (legacy `..._post_*s` → waveform, or
-    //     the ANE `..._ane[_ln]_3s` → spec/phase).
-    //   - split : the T6 rate-boundary pair (task T7), when the provider vends a
-    //     `GeneratorSplitModels`. trunk (x_pre/ref_s/har → the 2,400-frame seam)
-    //     then body (seam/ref_s/har → spec/phase), each half small enough to
-    //     clear the A14's fvmlib cap the monolithic package hit.
+    // Three shapes of generator flow through here, all entirely behind this
+    // stage boundary (decoder-pre, F0, the host iSTFT, and the
+    // SynthesisResult shape are untouched by the choice —
+    // README/Plans/ane-generator-a14-v1.md T7/T9):
+    //   - single  : one package, one predict (legacy `..._post_*s` →
+    //     waveform, or the ANE `..._ane[_ln]_3s` → spec/phase).
+    //   - split   : the T6 rate-boundary pair (task T7), when the provider
+    //     vends a `GeneratorSplitModels`. trunk (x_pre/ref_s/har → the
+    //     2,400-frame seam) then body (seam/ref_s/har → spec/phase), each
+    //     half small enough to clear the A14's fvmlib cap the monolithic
+    //     package hit.
+    //   - windowed (task T9): when `fullF0Len` (x_pre's time axis, planned by
+    //     stages 1-7 over the WHOLE frontend chunk — up to whatever bucket
+    //     `selectBucket` chose, 7/15/30 s buckets exist precisely so
+    //     decoder-pre/F0Ntrain can plan a whole sentence) exceeds one 3 s
+    //     window, no single predict is even possible: every exported
+    //     generator package is FIXED-shape at the 3 s bucket's geometry. Loop
+    //     the T7 split pair over fixed 240-ASR-frame windows instead
+    //     (`vocodeWindowed`, WindowedGeneratorExecutor.swift) — "plan prosody
+    //     globally, vocode in 3 s windows", the design T8's owner ear-check
+    //     green-lit (see this plan's Status log).
     let t14 = CFAbsoluteTimeGetCurrent()
     let genRefS = try makeZeroArray2D(dim: PipelineConstants.voiceEmbeddingDim)
     copyInto(array: genRefS, from: request.refS)
 
-    let splitModels = try modelProvider.generatorSplitModels(bucketSec: bucketSec)
-    // The model whose input geometry drives x_pre/har shaping: the trunk under
-    // a split (it takes the SAME x_pre/ref_s/har as the monolithic package),
-    // else the single generator.
-    let genInputModel = try splitModels?.trunk ?? modelProvider.generatorModel(bucketSec: bucketSec)
-    // The model that PRODUCES the outputs, keyed on to detect the ANE spec/phase
-    // contract: the body under a split, else the single generator.
-    let genOutputModel = splitModels?.body ?? genInputModel
-
-    let genShapes = inputShapes(from: genInputModel)
-    let xPreExpectedTime = genShapes["x_pre"]?.last ?? xPre.shape.last!.intValue
-    let harExpectedTime = genShapes["har"]?.last ?? harFrames
-    let xPrePadded = try zeroPad3D(
-        source: xPre,
-        channels: xPre.shape[1].intValue,
-        targetTime: xPreExpectedTime
-    )
-    let harPadded = try zeroPad3D(
-        sourceValues: harFlat,
-        channels: HarmonicConstants.harChannels,
-        sourceTime: harFrames,
-        targetTime: harExpectedTime
-    )
-
-    // ANE package detection (T5): via the output model's own description, not
-    // a policy flag threaded through the pipeline (README/Plans/ane-generator-a14-v1.md
-    // T5). The ANE packages (kokoro_decoder_har_ane[_ln]_3s, or the split's
-    // body) stop at spec/phase; the legacy package (kokoro_decoder_har_post_*s)
-    // outputs waveform.
-    let isAneGeneratorPackage = Set(genOutputModel.modelDescription.outputDescriptionsByName.keys)
-        .isSuperset(of: ["spec", "phase"])
-    if isAneGeneratorPackage {
-        // T5's geometry finding: unlike the baseline package's har axis
-        // (28,801, sized 2x the bucket's native frame count — see
-        // README/Notes/ane-pretrim-equivalence-2026-07-17.md's "Flagged for
-        // the owner" section), the ANE package's har axis (14,401) equals
-        // exactly what buildHar naturally produces for a 3 s bucket, and
-        // x_pre's 240 frames are always fully computed by decoder-pre (never
-        // padded — the "120 of 240" figure in that note is asr's own INPUT
-        // frame count, a different axis than x_pre's OUTPUT). Both axes are
-        // therefore fully real content here with no zero-padding, verified
-        // empirically against the Python reference
-        // (build_decoder_har_post_inputs_np) before this branch was wired.
-        print("ANEGEN: geometry x_pre_real=\(xPre.shape.last!.intValue)/\(xPreExpectedTime) har_real=\(harFrames)/\(harExpectedTime)")
-        #if DEBUG
-        assert(
-            xPre.shape.last!.intValue >= xPreExpectedTime,
-            "ANE generator x_pre input underfilled: decoder-pre produced \(xPre.shape.last!.intValue) " +
-            "real frames, package expects \(xPreExpectedTime) — geometry regression, see " +
-            "README/Plans/ane-generator-a14-v1.md T5"
-        )
-        assert(
-            harFrames >= harExpectedTime,
-            "ANE generator har input underfilled: buildHar produced \(harFrames) real frames, " +
-            "package expects \(harExpectedTime) — geometry regression, see " +
-            "README/Plans/ane-generator-a14-v1.md T5"
-        )
-        #endif
-    }
-
-    try tensorDump?.writeMLMultiArray(name: "x_pre_padded", array: xPrePadded)
-    try tensorDump?.writeMLMultiArray(name: "har_padded", array: harPadded)
-
-    // Split-trunk finiteness census, carried into Stage 9 so both halves are
-    // reported on a single localizing line. `nil` ⇒ single-package path.
-    var splitTrunkCensus: (fraction: Double, nonFinite: Int, total: Int)? = nil
-    let genOutput: MLFeatureProvider
-    if let splitModels {
-        let (bodyOutput, trunkSeam) = try predictGeneratorSplit(
-            trunk: splitModels.trunk,
-            body: splitModels.body,
-            xPre: xPrePadded,
-            refS: genRefS,
-            har: harPadded
-        )
-        splitTrunkCensus = finiteCensus(floatValues(from: trunkSeam))
-        try tensorDump?.writeMLMultiArray(name: "generator_trunk", array: trunkSeam)
-        genOutput = bodyOutput
-    } else {
-        let genInput = try MLDictionaryFeatureProvider(dictionary: [
-            "x_pre": MLFeatureValue(multiArray: xPrePadded),
-            "ref_s": MLFeatureValue(multiArray: genRefS),
-            "har": MLFeatureValue(multiArray: harPadded),
-        ])
-        genOutput = try genInputModel.prediction(from: genInput)
-    }
-    let t15 = CFAbsoluteTimeGetCurrent()
-    timings.generatorCoreML = t15 - t14
-
-    // Stage 9: waveform reconstruction, then trim.
-    //
-    // The legacy package (kokoro_decoder_har_post_*s) carries the iSTFT
-    // in-graph and returns `waveform` directly. The ANE package
-    // (kokoro_decoder_har_ane_3s) stops at spec/phase — every axis past that
-    // point exceeds the ANE's 16,384-elements-per-axis limit (see
-    // README/Plans/ane-generator-a14-v1.md Ground Truth) — so T3's host-side
-    // iSTFT (HostISTFT.swift) reconstructs the waveform here instead.
-    let t16 = CFAbsoluteTimeGetCurrent()
     var aneGeneratorFiniteFraction: Double? = nil
     let fullWaveform: [Float]
-    if isAneGeneratorPackage {
-        let specArray = genOutput.featureValue(for: "spec")!.multiArrayValue!
-        let phaseArray = genOutput.featureValue(for: "phase")!.multiArrayValue!
-        let specValues = floatValues(from: specArray)
-        let phaseValues = floatValues(from: phaseArray)
+    let t16: Double
+    // Static x_pre/har time dimensions the generator model actually consumed
+    // — reported in SynthesisResult below. Under windowing (task T9) this is
+    // the FIXED per-window 3 s package shape (every window, not the
+    // whole-chunk `fullF0Len`/`harFrames`); under single-predict it's
+    // whatever `inputShapes(from:)` reads off the vended model (unchanged).
+    let xPreExpectedTime: Int
+    let harExpectedTime: Int
 
-        // T5's finiteness gate (T4's inheritance): on this Mac the ANE admits
-        // the decoder-har-ane graph and then miscomputes it into non-finite
-        // output (README/Notes/ane-generator-coreml-export-2026-07-17.md).
-        // The phone's ANE is a different generation and may or may not
-        // reproduce this — checked on EVERY pass so the device run makes
-        // both admittance and correctness observable, not just the former.
-        // Under the split (task T7) the trunk seam is censused too, so a
-        // non-finite result localizes to a stage (trunk vs body) on one line.
-        let bodyCensus = finiteCensus(specValues + phaseValues)
-        if let trunkCensus = splitTrunkCensus {
-            let combinedNonFinite = trunkCensus.nonFinite + bodyCensus.nonFinite
-            let combinedTotal = trunkCensus.total + bodyCensus.total
-            let combinedFraction = combinedTotal > 0
-                ? 1.0 - Double(combinedNonFinite) / Double(combinedTotal) : 1.0
-            aneGeneratorFiniteFraction = combinedFraction
-            print(
-                "ANEGEN: split trunk finite-fraction=\(String(format: "%.4f", trunkCensus.fraction)) " +
-                "body finite-fraction=\(String(format: "%.4f", bodyCensus.fraction)) " +
-                "trunkNonFinite=\(trunkCensus.nonFinite) bodyNonFinite=\(bodyCensus.nonFinite) total=\(combinedTotal)"
+    // Windowing requires BOTH a chunk that overflows one window AND a
+    // provider that actually vends the 3 s split pair. Providers that don't
+    // (the runtime `KokoroPipeline` today, and every bench policy except
+    // `aneGeneratorSplit` — `generatorSplitModels` defaults to `nil`) MUST
+    // fall through to the unchanged single-predict path below, which already
+    // handles buckets > 3 s correctly via the LEGACY per-bucket package
+    // (`kokoro_decoder_har_post_<bucket>s`, one predict, no 3 s cap) — that
+    // is how every non-3s bucket has always worked and T9 must not regress
+    // it. Only `aneGeneratorSplit`-style providers, which guard
+    // `generatorModel`/`generatorSplitModels` to the 3 s bucket ALONE, need
+    // windowing to reach buckets > 3 s at all.
+    if fullF0Len > WindowedVocodeConstants.winASR,
+       let splitModels = try modelProvider.generatorSplitModels(bucketSec: WindowedVocodeConstants.windowBucketSec) {
+        let windowed = try vocodeWindowed(
+            xPre: xPre,
+            refS: genRefS,
+            harFlat: harFlat,
+            harFrames: harFrames,
+            asrLen: fullF0Len,
+            trunk: splitModels.trunk,
+            body: splitModels.body
+        )
+        let t15 = CFAbsoluteTimeGetCurrent()
+        // Covers the whole windowed loop (every window's split predict AND
+        // host iSTFT, interleaved) — coarser-grained than the single-predict
+        // path's generatorCoreML/trim split below, but StageTimings' FIELDS
+        // are unchanged (T7's "SynthesisResult/StageTimings shape...
+        // untouched" — only the final punctuation-suppression trim remains
+        // for `timings.trim` to measure here).
+        timings.generatorCoreML = t15 - t14
+        t16 = t15
+        aneGeneratorFiniteFraction = windowed.finiteFraction
+        print(
+            "ANEGEN: windowed windows=\(windowed.windowCount) " +
+            "finite-fraction=\(String(format: "%.4f", windowed.finiteFraction)) " +
+            "nonFinite=\(windowed.nonFinite) total=\(windowed.total)"
+        )
+        guard windowed.nonFinite == 0 else {
+            throw PipelineError.nonFiniteGeneratorOutput(finiteFraction: windowed.finiteFraction)
+        }
+        fullWaveform = windowed.waveform
+        xPreExpectedTime = WindowedVocodeConstants.winASR
+        harExpectedTime = WindowedVocodeConstants.bodyPerASR * WindowedVocodeConstants.winASR + 1
+    } else {
+        let splitModels = try modelProvider.generatorSplitModels(bucketSec: bucketSec)
+        // The model whose input geometry drives x_pre/har shaping: the trunk under
+        // a split (it takes the SAME x_pre/ref_s/har as the monolithic package),
+        // else the single generator.
+        let genInputModel = try splitModels?.trunk ?? modelProvider.generatorModel(bucketSec: bucketSec)
+        // The model that PRODUCES the outputs, keyed on to detect the ANE spec/phase
+        // contract: the body under a split, else the single generator.
+        let genOutputModel = splitModels?.body ?? genInputModel
+
+        let genShapes = inputShapes(from: genInputModel)
+        xPreExpectedTime = genShapes["x_pre"]?.last ?? xPre.shape.last!.intValue
+        harExpectedTime = genShapes["har"]?.last ?? harFrames
+        let xPrePadded = try zeroPad3D(
+            source: xPre,
+            channels: xPre.shape[1].intValue,
+            targetTime: xPreExpectedTime
+        )
+        let harPadded = try zeroPad3D(
+            sourceValues: harFlat,
+            channels: HarmonicConstants.harChannels,
+            sourceTime: harFrames,
+            targetTime: harExpectedTime
+        )
+
+        // ANE package detection (T5): via the output model's own description, not
+        // a policy flag threaded through the pipeline (README/Plans/ane-generator-a14-v1.md
+        // T5). The ANE packages (kokoro_decoder_har_ane[_ln]_3s, or the split's
+        // body) stop at spec/phase; the legacy package (kokoro_decoder_har_post_*s)
+        // outputs waveform.
+        let isAneGeneratorPackage = Set(genOutputModel.modelDescription.outputDescriptionsByName.keys)
+            .isSuperset(of: ["spec", "phase"])
+        if isAneGeneratorPackage {
+            // T5's geometry finding: unlike the baseline package's har axis
+            // (28,801, sized 2x the bucket's native frame count — see
+            // README/Notes/ane-pretrim-equivalence-2026-07-17.md's "Flagged for
+            // the owner" section), the ANE package's har axis (14,401) equals
+            // exactly what buildHar naturally produces for a 3 s bucket, and
+            // x_pre's 240 frames are always fully computed by decoder-pre (never
+            // padded — the "120 of 240" figure in that note is asr's own INPUT
+            // frame count, a different axis than x_pre's OUTPUT). Both axes are
+            // therefore fully real content here with no zero-padding, verified
+            // empirically against the Python reference
+            // (build_decoder_har_post_inputs_np) before this branch was wired.
+            print("ANEGEN: geometry x_pre_real=\(xPre.shape.last!.intValue)/\(xPreExpectedTime) har_real=\(harFrames)/\(harExpectedTime)")
+            #if DEBUG
+            assert(
+                xPre.shape.last!.intValue >= xPreExpectedTime,
+                "ANE generator x_pre input underfilled: decoder-pre produced \(xPre.shape.last!.intValue) " +
+                "real frames, package expects \(xPreExpectedTime) — geometry regression, see " +
+                "README/Plans/ane-generator-a14-v1.md T5"
             )
-            guard combinedNonFinite == 0 else {
-                throw PipelineError.nonFiniteGeneratorOutput(finiteFraction: combinedFraction)
-            }
-        } else {
-            aneGeneratorFiniteFraction = bodyCensus.fraction
-            print(
-                "ANEGEN: non-finite output check finite-fraction=\(String(format: "%.4f", bodyCensus.fraction)) " +
-                "nonFinite=\(bodyCensus.nonFinite) total=\(bodyCensus.total)"
+            assert(
+                harFrames >= harExpectedTime,
+                "ANE generator har input underfilled: buildHar produced \(harFrames) real frames, " +
+                "package expects \(harExpectedTime) — geometry regression, see " +
+                "README/Plans/ane-generator-a14-v1.md T5"
             )
-            guard bodyCensus.nonFinite == 0 else {
-                throw PipelineError.nonFiniteGeneratorOutput(finiteFraction: bodyCensus.fraction)
-            }
+            #endif
         }
 
-        let frameCount = specArray.shape.last!.intValue
-        fullWaveform = hostISTFTInverse(spec: specValues, phase: phaseValues, frameCount: frameCount)
-    } else {
-        let waveformKey = genOutput.featureNames.contains("waveform") ? "waveform" : genOutput.featureNames.first!
-        fullWaveform = floatValues(from: genOutput.featureValue(for: waveformKey)!.multiArrayValue!)
+        try tensorDump?.writeMLMultiArray(name: "x_pre_padded", array: xPrePadded)
+        try tensorDump?.writeMLMultiArray(name: "har_padded", array: harPadded)
+
+        // Split-trunk finiteness census, carried into Stage 9 so both halves are
+        // reported on a single localizing line. `nil` ⇒ single-package path.
+        var splitTrunkCensus: (fraction: Double, nonFinite: Int, total: Int)? = nil
+        let genOutput: MLFeatureProvider
+        if let splitModels {
+            let (bodyOutput, trunkSeam) = try predictGeneratorSplit(
+                trunk: splitModels.trunk,
+                body: splitModels.body,
+                xPre: xPrePadded,
+                refS: genRefS,
+                har: harPadded
+            )
+            splitTrunkCensus = finiteCensus(floatValues(from: trunkSeam))
+            try tensorDump?.writeMLMultiArray(name: "generator_trunk", array: trunkSeam)
+            genOutput = bodyOutput
+        } else {
+            let genInput = try MLDictionaryFeatureProvider(dictionary: [
+                "x_pre": MLFeatureValue(multiArray: xPrePadded),
+                "ref_s": MLFeatureValue(multiArray: genRefS),
+                "har": MLFeatureValue(multiArray: harPadded),
+            ])
+            genOutput = try genInputModel.prediction(from: genInput)
+        }
+        let t15 = CFAbsoluteTimeGetCurrent()
+        timings.generatorCoreML = t15 - t14
+
+        // Stage 9: waveform reconstruction, then trim.
+        //
+        // The legacy package (kokoro_decoder_har_post_*s) carries the iSTFT
+        // in-graph and returns `waveform` directly. The ANE package
+        // (kokoro_decoder_har_ane_3s) stops at spec/phase — every axis past that
+        // point exceeds the ANE's 16,384-elements-per-axis limit (see
+        // README/Plans/ane-generator-a14-v1.md Ground Truth) — so T3's host-side
+        // iSTFT (HostISTFT.swift) reconstructs the waveform here instead.
+        t16 = CFAbsoluteTimeGetCurrent()
+        if isAneGeneratorPackage {
+            let specArray = genOutput.featureValue(for: "spec")!.multiArrayValue!
+            let phaseArray = genOutput.featureValue(for: "phase")!.multiArrayValue!
+            let specValues = floatValues(from: specArray)
+            let phaseValues = floatValues(from: phaseArray)
+
+            // T5's finiteness gate (T4's inheritance): on this Mac the ANE admits
+            // the decoder-har-ane graph and then miscomputes it into non-finite
+            // output (README/Notes/ane-generator-coreml-export-2026-07-17.md).
+            // The phone's ANE is a different generation and may or may not
+            // reproduce this — checked on EVERY pass so the device run makes
+            // both admittance and correctness observable, not just the former.
+            // Under the split (task T7) the trunk seam is censused too, so a
+            // non-finite result localizes to a stage (trunk vs body) on one line.
+            let bodyCensus = finiteCensus(specValues + phaseValues)
+            if let trunkCensus = splitTrunkCensus {
+                let combinedNonFinite = trunkCensus.nonFinite + bodyCensus.nonFinite
+                let combinedTotal = trunkCensus.total + bodyCensus.total
+                let combinedFraction = combinedTotal > 0
+                    ? 1.0 - Double(combinedNonFinite) / Double(combinedTotal) : 1.0
+                aneGeneratorFiniteFraction = combinedFraction
+                print(
+                    "ANEGEN: split trunk finite-fraction=\(String(format: "%.4f", trunkCensus.fraction)) " +
+                    "body finite-fraction=\(String(format: "%.4f", bodyCensus.fraction)) " +
+                    "trunkNonFinite=\(trunkCensus.nonFinite) bodyNonFinite=\(bodyCensus.nonFinite) total=\(combinedTotal)"
+                )
+                guard combinedNonFinite == 0 else {
+                    throw PipelineError.nonFiniteGeneratorOutput(finiteFraction: combinedFraction)
+                }
+            } else {
+                aneGeneratorFiniteFraction = bodyCensus.fraction
+                print(
+                    "ANEGEN: non-finite output check finite-fraction=\(String(format: "%.4f", bodyCensus.fraction)) " +
+                    "nonFinite=\(bodyCensus.nonFinite) total=\(bodyCensus.total)"
+                )
+                guard bodyCensus.nonFinite == 0 else {
+                    throw PipelineError.nonFiniteGeneratorOutput(finiteFraction: bodyCensus.fraction)
+                }
+            }
+
+            let frameCount = specArray.shape.last!.intValue
+            fullWaveform = hostISTFTInverse(spec: specValues, phase: phaseValues, frameCount: frameCount)
+        } else {
+            let waveformKey = genOutput.featureNames.contains("waveform") ? "waveform" : genOutput.featureNames.first!
+            fullWaveform = floatValues(from: genOutput.featureValue(for: waveformKey)!.multiArrayValue!)
+        }
     }
 
     let originalF0Len = frames * 2

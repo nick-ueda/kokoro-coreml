@@ -164,6 +164,35 @@ final class MLMultiArrayBindingTests: XCTestCase {
         )
     }
 
+    func testSliceTime3DFromMLMultiArray() throws {
+        let source = try makeFloatArray(shape: [1, 2, 5], values: [1, 2, 3, 4, 5, 10, 20, 30, 40, 50])
+        let sliced = try sliceTime3D(source: source, channels: 2, lo: 1, hi: 4)
+
+        XCTAssertEqual(sliced.shape.map { $0.intValue }, [1, 2, 3])
+        XCTAssertEqual(floatValues(from: sliced), [2, 3, 4, 20, 30, 40])
+    }
+
+    func testSliceTime3DFromFlatChannelMajorValues() throws {
+        let sliced = try sliceTime3D(
+            sourceValues: [1, 2, 3, 4, 5, 10, 20, 30, 40, 50],
+            channels: 2,
+            sourceTime: 5,
+            lo: 1,
+            hi: 4
+        )
+
+        XCTAssertEqual(sliced.shape.map { $0.intValue }, [1, 2, 3])
+        XCTAssertEqual(floatValues(from: sliced), [2, 3, 4, 20, 30, 40])
+    }
+
+    func testSliceTime3DRejectsOutOfBoundsRange() throws {
+        XCTAssertThrowsError(
+            try sliceTime3D(sourceValues: [1, 2, 3, 4], channels: 2, sourceTime: 2, lo: 0, hi: 3)
+        )
+        let source = try makeFloatArray(shape: [1, 2, 3], values: [1, 2, 3, 4, 5, 6])
+        XCTAssertThrowsError(try sliceTime3D(source: source, channels: 2, lo: 2, hi: 1))
+    }
+
     func testValidateDurationAgreementRejectsHalfLengthAudio() throws {
         XCTAssertThrowsError(
             try validateDurationAgreement(inputKey: "15s", canonical: 13.9, observed: 6.4)

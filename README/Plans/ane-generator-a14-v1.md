@@ -617,6 +617,80 @@ SEPARATE owner step in `~/Git/FreeReader` — agents do NOT touch that repo.
   `KokoroModelProvider` wiring. T9 is the next coding task; T10/T11 gate on owner
   device runs.
 
+- 2026-07-18 **T9 COMPLETE** — windowed-vocode executor wired behind the T7
+  `predictGeneratorSplit` seam, Mac-verified; no A14 execution claimed. New file
+  `swift/Sources/KokoroPipeline/WindowedGeneratorExecutor.swift`:
+  `windowedVocodePlan(asrLen:)` (pure geometry) + `vocodeWindowed` (the loop:
+  per-window slice, split predict, host iSTFT) + `stitchWindowedWaveforms` (pure
+  crop/concat/trim, factored out for isolated testing). `KokoroSynthesisExecutor`
+  Stage 8/9 now has three shapes -- single / split / windowed -- selected by
+  `fullF0Len > 240 && generatorSplitModels(bucketSec: 3) != nil`; the second
+  clause is load-bearing: it keeps every existing provider (the runtime
+  `KokoroPipeline`, and every bench policy except `aneGeneratorSplit`) on the
+  UNCHANGED legacy per-bucket single-predict path for buckets > 3 s, since only
+  `aneGeneratorSplit`-style providers guard the legacy package to the 3 s bucket
+  and therefore need windowing to reach longer buckets at all. Caught and fixed
+  in-session: an earlier version triggered windowing for ANY provider once
+  `fullF0Len > 240`, which would have thrown `PipelineError.modelNotLoaded` on
+  the runtime path for any utterance selecting a 7/15/30 s bucket -- a real
+  regression, not shipped.
+
+  **Both T9 STOP-and-report gotchas resolved, no deviation needed:** (1) decoder-pre
+  packages at 7/15/30 s DO exist (`ios-bench/Resources/coreml/
+  kokoro_decoder_pre_{7,15,30}s.mlpackage`) and `aneGenerator`/`aneGeneratorSplit`
+  pin `decoderPre: .cpuAndNeuralEngine` regardless of bucket -- confirmed via a
+  direct `coremltools` spec read, not assumed. (2) the ANE package's fixed 240-frame
+  shape vs shorter natural edge windows: `windowedVocodePlan` shifts a clipped edge
+  window INWARD to a full 240-frame span (overlapping the neighbor's territory for
+  context only; the kept core is unchanged) rather than zero-padding -- proven general
+  by hand (`WindowedVocodePlanTests`) for both exact-multiple and partial-last-core
+  utterance lengths.
+
+  **Geometry correction made mid-session, load-bearing:** the windowing "asr_len" is
+  the executor's `fullF0Len` (Stage 5's `f0`/`n_input`/`x_pre` axis -- 240 for 3 s, 1200
+  for 15 s), NOT the `frameCount` variable used to build decoder-pre's `asr` INPUT
+  (120 for 3 s, half of `fullF0Len` -- decoder-pre has its own internal 2x upsample
+  between that input and its `x_pre` output). Verified empirically against the
+  compiled `.mlpackage`s (`coremltools` spec read on `kokoro_decoder_pre_{3,15}s`)
+  before wiring, not assumed from the plan's Ground Truth prose (whose own
+  `full_f0_len=480` figure is a SEPARATE, export-trace-time-only convention --
+  see the new file's header for the full reconciliation). Also empirically
+  confirmed: Swift's native-geometry `buildHar` output is already exactly
+  `60*asrLen+1` frames -- no 2x-oversized "natural" har and no truncation needed
+  anywhere in the windowed path, unlike the Python export-time scripts' `har_t`
+  convention.
+
+  **Testing (mirrors T3's isolation philosophy, not T7's model-parity-only
+  approach):** a tight max-abs<1e-4 gate on CoreML-model output was not achievable
+  against a fp32 PyTorch reference -- same fp16-CoreML-vs-fp32-PyTorch gap T4/T6/T7
+  already characterized at ~40-46 dB SNR, not a tight bound -- so testing split in two:
+  `WindowedVocodeGoldenTests` isolates T9's actual NEW arithmetic (window
+  geometry + crop/concat/trim) by feeding `stitchWindowedWaveforms` the dump
+  script's own per-window PyTorch waveforms and comparing to `wav_w.f32` -- max-abs
+  0 across the board, comfortably inside the 1e-4 gate (pure fp32 array
+  slicing/concat on both sides). `WindowedGeneratorSplitIntegrationTests` separately
+  runs the REAL `kokoro_decoder_har_ane_ln_{trunk,body}_3s` packages end-to-end
+  (mirrors `GeneratorSplitParityTests`, `CPU_AND_GPU`, never `CPU_AND_NE` -- this
+  Mac's ANE miscompute is unrelated and already documented) -- measured **46.31 dB**
+  SNR vs `wav_w.f32` (gate 35, set with headroom), essentially matching T7's
+  single-predict 48.73 dB, i.e. windowing itself costs negligible extra SNR beyond
+  the already-known fp16 boundary. `WindowedVocodePlanTests` covers the pure
+  geometry (fixed-width windows, lossless core tiling, hand-derived edge cases,
+  cross-checked against the golden fixture's independently-computed plan).
+  New fixtures: `scripts/dump_windowed_vocode_golden.py` (600 ASR frames / 3
+  windows -- both edge-overlap cases plus one true interior window -- dumps
+  `x_pre`/`ref_s`/`har`/`wav_w`/per-window waveforms/`meta.json` into
+  `swift/Tests/KokoroPipelineTests/Fixtures/windowed_vocode/`, ~6.3 MB). Also added
+  `sliceTime3D` (two overloads, mirroring `zeroPad3D`'s) to
+  `MLMultiArrayHelpers.swift`, with its own unit tests. Acceptance met: `swift test`
+  **59/59**, `xcodebuild ... build` **SUCCEEDED**. No package re-export, no
+  `kokoro/istftnet.py` change, `~/Git/FreeReader` untouched. What T10 inherits: the
+  windowed path activates automatically under `--policy aneGeneratorSplit` for any
+  bucket > 3 s (`--keys 7s`/`15s`/`30s`) -- no new bench flag was needed, since the
+  provider-capability guard above is exactly the switch. Device execution
+  (finite-fraction across a real windowed run, fp16 ear-check) is owner-run, folded
+  into T10 as planned.
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give

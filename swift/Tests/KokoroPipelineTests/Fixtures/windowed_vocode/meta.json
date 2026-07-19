@@ -1,0 +1,27 @@
+{
+  "asr_len": 600,
+  "x_pre_channels": 512,
+  "har_channels": 22,
+  "har_body_frames": 36001,
+  "window_count": 3,
+  "windows": [
+    {
+      "lo": 0,
+      "hi": 240,
+      "core_lo": 0,
+      "core_hi": 200
+    },
+    {
+      "lo": 180,
+      "hi": 420,
+      "core_lo": 200,
+      "core_hi": 400
+    },
+    {
+      "lo": 360,
+      "hi": 600,
+      "core_lo": 400,
+      "core_hi": 600
+    }
+  ]
+}

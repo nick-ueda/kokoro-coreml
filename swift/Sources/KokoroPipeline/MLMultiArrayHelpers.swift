@@ -433,6 +433,78 @@ public func zeroPad3D(
     return result
 }
 
+// MARK: - Time-Axis Slicing (windowed generator, task T9)
+
+/// Slice a 3D MLMultiArray's time axis to `[lo, hi)`, returning a FRESH
+/// contiguous `(1, channels, hi-lo)` array — never a view. The windowed
+/// generator (`vocodeWindowed`, WindowedGeneratorExecutor.swift) needs a
+/// dense array on the exact fixed shape the 3 s split package expects, the
+/// same requirement `zeroPad3D` serves for padding; this is its slicing
+/// counterpart.
+public func sliceTime3D(source: MLMultiArray, channels: Int, lo: Int, hi: Int) throws -> MLMultiArray {
+    let sourceShape = source.shape.map { $0.intValue }
+    guard sourceShape.count >= 3, sourceShape[0] == 1, sourceShape[1] == channels,
+          lo >= 0, hi <= sourceShape[2], lo <= hi else {
+        throw PipelineValidationError.invalidArrayShape(
+            operation: "sliceTime3D",
+            expected: "(1, \(channels), time>=\(hi)) sliceable to [\(lo), \(hi))",
+            actual: sourceShape
+        )
+    }
+    let sliceLen = hi - lo
+    let result = try makeZeroArray3D(channels: channels, time: sliceLen)
+    let srcTime = sourceShape[2]
+    let srcStrides = source.strides.map { $0.intValue }
+    let isContiguous = srcStrides.count >= 3 && srcStrides[2] == 1 && srcStrides[1] == srcTime
+    let dstPtr = result.dataPointer.assumingMemoryBound(to: Float.self)
+
+    if isContiguous {
+        let srcPtr = source.dataPointer.assumingMemoryBound(to: Float.self)
+        for c in 0..<channels {
+            memcpy(dstPtr + c * sliceLen, srcPtr + c * srcTime + lo, sliceLen * MemoryLayout<Float>.size)
+        }
+    } else {
+        for c in 0..<channels {
+            for t in 0..<sliceLen {
+                dstPtr[c * sliceLen + t] = source[[0, c, t + lo] as [NSNumber]].floatValue
+            }
+        }
+    }
+    return result
+}
+
+/// Slice a flat channel-major buffer's time axis to `[lo, hi)`, returning a
+/// fresh `(1, channels, hi-lo)` MLMultiArray. The direct path for
+/// Swift-built tensors such as `har` (already a flat `(channels, sourceTime)`
+/// buffer) — mirrors the `zeroPad3D(sourceValues:...)` overload above, but
+/// slices a sub-range instead of prefix-copying into a zero/target buffer.
+public func sliceTime3D(
+    sourceValues: [Float],
+    channels: Int,
+    sourceTime: Int,
+    lo: Int,
+    hi: Int
+) throws -> MLMultiArray {
+    let expectedCount = channels * sourceTime
+    guard channels > 0, lo >= 0, hi <= sourceTime, lo <= hi, sourceValues.count == expectedCount else {
+        throw PipelineValidationError.invalidArrayShape(
+            operation: "sliceTime3D",
+            expected: "(1, \(channels), \(sourceTime)) flat channel-major count \(expectedCount), sliceable to [\(lo), \(hi))",
+            actual: [sourceValues.count]
+        )
+    }
+    let sliceLen = hi - lo
+    let result = try makeZeroArray3D(channels: channels, time: sliceLen)
+    let dstPtr = result.dataPointer.assumingMemoryBound(to: Float.self)
+    sourceValues.withUnsafeBufferPointer { srcBuf in
+        guard let srcBase = srcBuf.baseAddress else { return }
+        for c in 0..<channels {
+            memcpy(dstPtr + c * sliceLen, srcBase + c * sourceTime + lo, sliceLen * MemoryLayout<Float>.size)
+        }
+    }
+    return result
+}
+
 /// Zero-pad a 1D array (1, T_src) to (1, T_target).
 ///
 /// Matches: ``f0_pad = np.zeros((1, full_f0_len)); f0_pad[:,:t] = f0[:,:t]``
