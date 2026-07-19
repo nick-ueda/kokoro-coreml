@@ -440,7 +440,8 @@ public func executeKokoroSynthesis(
     // `generatorModel`/`generatorSplitModels` to the 3 s bucket ALONE, need
     // windowing to reach buckets > 3 s at all.
     if fullF0Len > WindowedVocodeConstants.winASR,
-       let splitModels = try modelProvider.generatorSplitModels(bucketSec: WindowedVocodeConstants.windowBucketSec) {
+       let splitModels = try modelProvider.generatorSplitModels(
+           bucketSec: windowedSplitBucket(fullF0Len: fullF0Len, planningBucketSec: bucketSec)) {
         let windowed = try vocodeWindowed(
             xPre: xPre,
             refS: genRefS,
@@ -846,7 +847,19 @@ private func warmModels(
         }
         _ = try model.prediction(from: try MLDictionaryFeatureProvider(dictionary: warmInputs))
     }
-    if let splitModels = try modelProvider.generatorSplitModels(bucketSec: probe.bucketSec) {
+    // Warm exactly the generator package(s) Stage 8/9 will run — mirror its
+    // three-way branch. A chunk over one window runs the windowed 3 s split,
+    // requested at `windowedSplitBucket` (NOT `probe.bucketSec`, or an
+    // aneGeneratorSplit warm-up at a > 3 s bucket throws the provider's 3 s-only
+    // split guard before synthesis, which asks for the split at 3 s, ever runs);
+    // otherwise the T7 single-predict split at the chunk's own bucket, else the
+    // single package.
+    if probe.fullF0Len > WindowedVocodeConstants.winASR,
+       let splitModels = try modelProvider.generatorSplitModels(
+           bucketSec: windowedSplitBucket(fullF0Len: probe.fullF0Len, planningBucketSec: probe.bucketSec)) {
+        try warmGenerator(splitModels.trunk)
+        try warmGenerator(splitModels.body)
+    } else if let splitModels = try modelProvider.generatorSplitModels(bucketSec: probe.bucketSec) {
         try warmGenerator(splitModels.trunk)
         try warmGenerator(splitModels.body)
     } else {

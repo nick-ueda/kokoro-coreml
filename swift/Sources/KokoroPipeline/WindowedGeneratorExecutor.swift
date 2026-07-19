@@ -65,6 +65,28 @@ public enum WindowedVocodeConstants {
     public static let windowBucketSec = 3
 }
 
+/// The generator bucket the split trunk/body packages are requested at, for a
+/// chunk whose planned `x_pre` axis is `fullF0Len` frames long and was planned
+/// at `planningBucketSec`.
+///
+/// When the chunk exceeds one 3 s window the generator ALWAYS runs the fixed
+/// 3 s split, looped (`vocodeWindowed`) — the larger 7/15/30 s bucket exists
+/// only so stages 1-7 can plan prosody over the whole sentence; no generator
+/// package is exported at those sizes. Below one window it runs the split at the
+/// chunk's own bucket (the T7 single-predict path).
+///
+/// Both the synthesis path (`executeKokoroSynthesis` Stage 8/9) and the warm
+/// path (`warmModels`) request the windowed split at THIS bucket, so warm-up
+/// loads exactly the packages synthesis will run. Requesting it at the raw
+/// `planningBucketSec` instead makes an `aneGeneratorSplit` warm-up at a > 3 s
+/// bucket throw that provider's 3 s-only split guard BEFORE synthesis (which
+/// asks for the split at 3 s) ever runs.
+public func windowedSplitBucket(fullF0Len: Int, planningBucketSec: Int) -> Int {
+    fullF0Len > WindowedVocodeConstants.winASR
+        ? WindowedVocodeConstants.windowBucketSec
+        : planningBucketSec
+}
+
 /// One window's slice boundaries, in ASR frames (the `fullF0Len`/`x_pre` time axis).
 ///
 /// `lo`/`hi`: the INPUT span fed to the generator (always

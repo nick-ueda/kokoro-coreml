@@ -691,6 +691,24 @@ SEPARATE owner step in `~/Git/FreeReader` — agents do NOT touch that repo.
   (finite-fraction across a real windowed run, fp16 ear-check) is owner-run, folded
   into T10 as planned.
 
+- 2026-07-18 **T9 FOLLOW-UP — warm-path split-bucket fix (owner-validated).** T9's
+  reachability claim above (windowing "activates automatically under
+  `--policy aneGeneratorSplit` for any bucket > 3 s") held for the synthesis path
+  but NOT warm-up: Stage 8/9 requests the windowed split at a fixed 3 s, but
+  `warmModels` still requested it at the raw planning bucket (`probe.bucketSec`), so
+  warming an `aneGeneratorSplit` run at a > 3 s bucket threw the provider's 3 s-only
+  split guard (`BenchApp.generatorSplitModels`) at launch, BEFORE synthesis — exactly
+  what T10's first `--keys 15s --policy aneGeneratorSplit` run would have hit. It
+  slipped through because the T9 tests call `vocodeWindowed` directly, bypassing warm.
+  Fix: extracted the shared decision `windowedSplitBucket(fullF0Len:planningBucketSec:)`
+  (WindowedGeneratorExecutor.swift), now used by BOTH Stage 8/9 and `warmModels`
+  (which mirrors synthesis's three-way branch: windowed 3 s split / single-predict
+  split / single package). Regression test `WindowedSplitBucketTests` (3 cases) locks
+  the decision and the guard-clearing invariant. `swift test` **62/62** (was 59;
+  `WINDOWEDPARITY` 46.31 / `SPLITPARITY` 48.73 dB unchanged — synthesis path
+  behavior-identical), `xcodebuild ... build` **SUCCEEDED**. T10's device path is now
+  clear of this launch-time throw.
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give
