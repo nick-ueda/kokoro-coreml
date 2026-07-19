@@ -740,6 +740,31 @@ SEPARATE owner step in `~/Git/FreeReader` — agents do NOT touch that repo.
   power number) and T12 (runtime wiring) are next; both still gate on this owner
   device run.
 
+- 2026-07-18 **T10 DEVICE GATE RUN (owner, iPhone 12 Pro / A14) — fp16 long-form
+  PASSES by ear, and the numbers back it.** `--arms coreml --keys 15s --policy
+  aneGeneratorSplit` on a real 13.9 s utterance (6 × 3 s windows). Results JSON
+  `~/Downloads/aneGeneratorSplit_15s.json`:
+  - **Audio quality: owner ear-check "sounds great"** — the fp16-on-A14 rendering
+    question open since T8 (finite ≠ good-sounding) is now CLOSED. The windowed
+    long-form path is perceptually good on the actual silicon, not just fp32/Mac.
+  - **RTF ~0.60** (median wall 8.38 s for 13.9 s audio; `overall_rtf` 0.61 over 5
+    timed iters ≈ **1.6× realtime**) — comfortably ahead of realtime for background
+    buffering (slower than the 3 s single-window ~0.4 because decoder-pre runs at
+    15 s and the generator does 6 windowed predicts, as expected).
+  - **All 5 timed iterations finite** (`ane_finite_fractions [1,1,1,1,1]`); the
+    Stage 8/9 throw-on-any-non-finite gate means this is a hard "no NaN across the
+    whole run" receipt, not a soft average.
+  - **Thermal steady `fair`** across all 7 iters (never `serious`) — but this is a
+    ~50 s run, NOT a sustained soak; steady-state heat is still a T11 question.
+  - **Watch item → T12: cold ANE compile is a noticeable first-load stall.** The
+    owner felt it; it's absorbed by the bench's 2 warmups so it stays OUT of the
+    clean 8.38 s median, but in the real app a cold launch (or a lost-ANE-state
+    background return) pays it. This makes T12's launch-time ANE pre-warm
+    MANDATORY, not optional (direction note: 4.9 s cool → 411 s thermally-pressured).
+    A hard cold-compile number is worth reading off the T10 console `BENCH:` log
+    (warmup-iter 0 wall vs the 8.38 s warm median). **Next: T11 (power) then T12
+    (production wiring + pre-warm).**
+
 ## Execution protocol
 
 One task per fresh agent session, launched in `~/Git/kokoro-coreml`. Give
