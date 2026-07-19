@@ -63,6 +63,19 @@
 /// ``SynthesisResult/timings`` (StageTimings in KokoroPipeline.swift), which
 /// the executor populates unconditionally on every call. Console lines
 /// prefixed "BENCH:" mirror progress; "BENCHDONE" marks completion.
+///
+/// Long-form device bench + WAV capture (task T10,
+/// README/Plans/ane-generator-a14-v1.md): every successful ladder-mode
+/// (coreml arm) (key, policy) pair writes its last timed iteration's audio to
+/// Documents/audio-<key>-<policy>.wav (24 kHz mono, no per-file peak
+/// normalization — see ``writeWavMono16NoPeakNormalize``) and logs the path.
+/// Feeding this a bucket > 3 s under `--policy aneGeneratorSplit` (e.g.
+/// `--keys 15s`) exercises T9's windowed executor and gives the owner a real
+/// fp16 A14 ear-check artifact (T8's Mac listen was fp32). Each such pair also
+/// logs an aggregate "ANEGEN SUMMARY:" line — min/mean ANE finite-fraction
+/// across the timed iterations (see ``SynthesisResult/aneGeneratorFiniteFraction``)
+/// plus total wall time and RTF over the whole run — and folds the same fields
+/// into the results JSON record.
 import SwiftUI
 import AVFoundation
 import CoreML
@@ -389,6 +402,18 @@ private struct WarmSeries {
     var thermalStates: [String] = []
     var bucketSeconds: Int = 0
     var durationCacheKey: String = ""
+    /// ``SynthesisResult/aneGeneratorFiniteFraction`` per timed iteration —
+    /// `nil` entries mean that call used the legacy in-graph-iSTFT package
+    /// (the gate doesn't apply). Task T10: surfaced as an aggregate so the
+    /// device run makes ANE correctness observable across the WHOLE run, not
+    /// just the last console line.
+    var aneFiniteFractions: [Double?] = []
+    /// Raw audio from the last timed iteration — every timed call
+    /// re-synthesizes the identical input (fixed seed), so any one iteration
+    /// is representative; keeping only the latest bounds memory to one copy.
+    /// Written to a WAV in Documents by the caller (task T10) so the owner
+    /// can retrieve the real fp16 A14 output for an ear-check.
+    var lastAudio: [Float] = []
 }
 
 /// StageTimings → JSON dict (seconds). Keys mirror the StageTimings field
@@ -424,6 +449,51 @@ private func stageSummaries(_ rows: [StageTimings]) -> (arrays: [String: [Double
         }
     }
     return (arrays, arrays.mapValues { median($0) })
+}
+
+/// Writes mono 16-bit PCM WAV at `sampleRate` Hz with NO per-file peak
+/// normalization — mirrors `scripts/probe_har_pretrim_adain_equivalence.py`'s
+/// `_write_wav` (also used by `scripts/probe_windowed_vocode.py` as `P._write_wav`),
+/// which takes gain as an explicit shared parameter rather than deriving it
+/// per file: a peak-seeking normalize would always hit 0 dBFS and hide real
+/// level information from the owner's fp16 A14 ear-check (task T10,
+/// README/Plans/ane-generator-a14-v1.md). ``SynthesisResult/audio`` is already
+/// scaled to roughly [-1, 1] by the pipeline, so a plain clip-and-quantize is
+/// sufficient — unlike the Mac `kokoro-bench` CLI's `writeWavMono16`
+/// (swift/Sources/KokoroBenchmark/main.swift), which peak-normalizes and is
+/// therefore not reused here.
+private func writeWavMono16NoPeakNormalize(path: URL, samples: [Float], sampleRate: UInt32) throws {
+    var pcm = [Int16](repeating: 0, count: samples.count)
+    for i in 0..<samples.count {
+        let x = max(-1.0, min(1.0, samples[i]))
+        pcm[i] = Int16((x * 32767.0).rounded())
+    }
+    let dataSize = UInt32(samples.count * 2)
+    let byteRate = sampleRate * 2
+
+    var d = Data()
+    d.append(contentsOf: "RIFF".utf8)
+    let riffChunkSize: UInt32 = 36 + dataSize
+    withUnsafeBytes(of: riffChunkSize.littleEndian) { d.append(contentsOf: $0) }
+    d.append(contentsOf: "WAVE".utf8)
+    d.append(contentsOf: "fmt ".utf8)
+    let subchunk1Size: UInt32 = 16
+    withUnsafeBytes(of: subchunk1Size.littleEndian) { d.append(contentsOf: $0) }
+    let audioFormat: UInt16 = 1
+    withUnsafeBytes(of: audioFormat.littleEndian) { d.append(contentsOf: $0) }
+    let numChannels: UInt16 = 1
+    withUnsafeBytes(of: numChannels.littleEndian) { d.append(contentsOf: $0) }
+    withUnsafeBytes(of: sampleRate.littleEndian) { d.append(contentsOf: $0) }
+    withUnsafeBytes(of: byteRate.littleEndian) { d.append(contentsOf: $0) }
+    let blockAlign: UInt16 = 2
+    withUnsafeBytes(of: blockAlign.littleEndian) { d.append(contentsOf: $0) }
+    let bitsPerSample: UInt16 = 16
+    withUnsafeBytes(of: bitsPerSample.littleEndian) { d.append(contentsOf: $0) }
+    d.append(contentsOf: "data".utf8)
+    withUnsafeBytes(of: dataSize.littleEndian) { d.append(contentsOf: $0) }
+    pcm.withUnsafeBytes { d.append(contentsOf: $0) }
+
+    try d.write(to: path)
 }
 
 private func thermalStateName() -> String {
@@ -759,6 +829,8 @@ final class BenchRunner: ObservableObject {
             if i >= Self.warmups {
                 series.wallTimes.append(result.wallTimeSeconds)
                 series.stageRows.append(result.timings)
+                series.aneFiniteFractions.append(result.aneGeneratorFiniteFraction)
+                series.lastAudio = result.audio
             }
             await log("coreml \(key) policy=\(policyName) iter \(i): \(String(format: "%.3f", result.wallTimeSeconds))s bucket=\(result.bucketSeconds)s gen=\(String(format: "%.3f", result.timings.generatorCoreML))s")
         }
@@ -785,13 +857,24 @@ final class BenchRunner: ObservableObject {
         ] as [String: Any])
     }
 
-    /// Success record shared by ladder and matrix paths.
+    /// Success record shared by ladder and matrix paths. Task T10 additions:
+    /// `total_wall_s`/`total_audio_s`/`overall_rtf` sum over every TIMED
+    /// iteration (vs `median_s`/`rtf`'s single-call figures) — the aggregate
+    /// the owner reads off for a long-form run; `ane_*_finite_fraction` (only
+    /// present when at least one call went through an ANE spec/phase package)
+    /// makes the T5 finiteness gate's verdict observable across the WHOLE
+    /// run, not just the last "ANEGEN:" console line. `wavPath`, when passed,
+    /// is the retrievable WAV `runCoreMLArm` just wrote for this pair.
     nonisolated private func recordSuccess(
-        key: String, policyName: String, series: WarmSeries, canonicalDuration: Double
+        key: String, policyName: String, series: WarmSeries, canonicalDuration: Double,
+        wavPath: String? = nil
     ) async {
         let med = median(series.wallTimes)
         let stages = stageSummaries(series.stageRows)
-        await record([
+        let totalWall = series.wallTimes.reduce(0, +)
+        let totalAudio = canonicalDuration * Double(series.wallTimes.count)
+        let finiteFractions = series.aneFiniteFractions.compactMap { $0 }
+        var rec: [String: Any] = [
             "arm": "coreml",
             "key": key,
             "compute_policy": policyName,
@@ -804,8 +887,59 @@ final class BenchRunner: ObservableObject {
             "duration_cache_key": series.durationCacheKey,
             "canonical_duration_s": canonicalDuration,
             "rtf": canonicalDuration > 0 && med > 0 ? med / canonicalDuration : 0,
+            "total_wall_s": totalWall,
+            "total_audio_s": totalAudio,
+            "overall_rtf": totalAudio > 0 ? totalWall / totalAudio : 0,
             "error": NSNull(),
-        ] as [String: Any])
+        ]
+        if !finiteFractions.isEmpty {
+            rec["ane_finite_fractions"] = finiteFractions
+            rec["ane_min_finite_fraction"] = finiteFractions.min()!
+            rec["ane_mean_finite_fraction"] = finiteFractions.reduce(0, +) / Double(finiteFractions.count)
+        }
+        if let wavPath { rec["wav_path"] = wavPath }
+        await record(rec)
+    }
+
+    /// Task T10: writes the series' last-iteration audio to
+    /// Documents/audio-<key>-<policy>.wav (retrievable via devicectl/Finder —
+    /// see README/Notes for the exact owner steps) and logs an "ANEGEN
+    /// SUMMARY:" line aggregating the ANE finiteness gate and RTF over every
+    /// timed iteration, not just one call. Returns the written path (nil if
+    /// there was no audio to write, e.g. a `mode-level`/`arm-level` failure
+    /// record never reached `runWarmSeries`, or the write itself failed —
+    /// logged, never fatal: WAV capture is observability, not correctness).
+    nonisolated private func persistWavAndLogSummary(
+        key: String, policyName: String, series: WarmSeries, canonicalDuration: Double
+    ) async -> String? {
+        var wavPath: String? = nil
+        if !series.lastAudio.isEmpty {
+            let url = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)[0]
+                .appendingPathComponent("audio-\(key)-\(policyName).wav")
+            do {
+                try writeWavMono16NoPeakNormalize(
+                    path: url, samples: series.lastAudio, sampleRate: UInt32(PipelineConstants.sampleRate)
+                )
+                wavPath = url.path
+                await log("coreml \(key) policy=\(policyName) WAV written: \(url.path)")
+            } catch {
+                await log("coreml \(key) policy=\(policyName) WAV write FAILED: \(error)")
+            }
+        }
+        let finiteFractions = series.aneFiniteFractions.compactMap { $0 }
+        if !finiteFractions.isEmpty {
+            let totalWall = series.wallTimes.reduce(0, +)
+            let totalAudio = canonicalDuration * Double(series.wallTimes.count)
+            let overallRtf = totalAudio > 0 ? totalWall / totalAudio : 0
+            let line = "ANEGEN SUMMARY \(key) policy=\(policyName): iterations=\(finiteFractions.count) " +
+                "min-finite-fraction=\(String(format: "%.4f", finiteFractions.min()!)) " +
+                "mean-finite-fraction=\(String(format: "%.4f", finiteFractions.reduce(0, +) / Double(finiteFractions.count))) " +
+                "total-wall-s=\(String(format: "%.3f", totalWall)) total-audio-s=\(String(format: "%.1f", totalAudio)) " +
+                "rtf=\(String(format: "%.3f", overallRtf))"
+            print(line)
+            await log(line)
+        }
+        return wavPath
     }
 
     // MARK: Ladder mode (default)
@@ -848,7 +982,10 @@ final class BenchRunner: ObservableObject {
 
             let dur = input.canonical_duration_s ?? 0
             if let series {
-                await recordSuccess(key: key, policyName: ladder[ladderIndex].name, series: series, canonicalDuration: dur)
+                let wavPath = await persistWavAndLogSummary(
+                    key: key, policyName: ladder[ladderIndex].name, series: series, canonicalDuration: dur
+                )
+                await recordSuccess(key: key, policyName: ladder[ladderIndex].name, series: series, canonicalDuration: dur, wavPath: wavPath)
             } else {
                 await record([
                     "arm": "coreml",
